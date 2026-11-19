@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .codex_config import DEFAULT_DEEP_MODEL, DEFAULT_MODEL
+
 ModelOption = tuple[str, str]
 ProviderModeOptions = dict[str, dict[str, list[ModelOption]]]
 
@@ -203,6 +205,10 @@ MODEL_OPTIONS: ProviderModeOptions = {
     # Generic OpenAI-compatible endpoint: the model is whatever the user's
     # server serves, so only "Custom model ID" is offered.
     "openai_compatible": _CUSTOM_ONLY,
+    "codex": {
+        "quick": [("GPT-6.2 Sol", DEFAULT_MODEL), ("GPT-6.2 Astra", DEFAULT_DEEP_MODEL), ("Custom model ID", "custom")],
+        "deep": [("GPT-6.2 Astra", DEFAULT_DEEP_MODEL), ("GPT-6.2 Sol", DEFAULT_MODEL), ("Custom model ID", "custom")],
+    },
     # Hosted OpenAI-compatible providers that serve many (and frequently
     # changing) models — offer "Custom model ID" rather than a list that goes
     # stale. The endpoint + key are wired by the provider; the user picks the

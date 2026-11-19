@@ -63,9 +63,21 @@ if ! "$python" -c 'import sys; sys.exit(sys.version_info < (3, 11))'; then
   printf '%s\n' 'Market Desk requires Python 3.11 or newer in .venv.' >&2
   exit 1
 fi
-if ! command -v npm >/dev/null 2>&1 || ! command -v node >/dev/null 2>&1; then
-  printf '%s\n' 'Install Node.js 20.19+ or 22.12+ and npm to build Market Desk.' >&2
-  exit 1
+node_is_supported() {
+  command -v npm >/dev/null 2>&1 && node -e '
+    const [major, minor] = process.versions.node.split(".").map(Number);
+    const supported = (major === 20 && minor >= 19) || (major === 22 && minor >= 12) || major > 22;
+    process.exit(supported ? 0 : 1);
+  ' >/dev/null 2>&1
+}
+
+if ! node_is_supported; then
+  node_bin="$("$python" tradingagents/dashboard/node_runtime.py "$repo_dir/.venv")"
+  export PATH="$node_bin:$PATH"
+  if ! node_is_supported; then
+    printf '%s\n' 'The downloaded Node.js could not run. Install Node.js 24 LTS with npm for your operating system.' >&2
+    exit 1
+  fi
 fi
 
 python_ready=.venv/.market-desk-installed
@@ -85,11 +97,4 @@ if [[ ! -x web/node_modules/.bin/vite || ! -f web/node_modules/.package-lock.jso
 fi
 npm --prefix web run build
 
-if [[ "$mode" == tunnel ]]; then
-  exec "$python" -m tradingagents.dashboard.tunnel "$port"
-fi
-
-printf '\nMarket Desk is starting at http://127.0.0.1:%s/\n' "$port"
-printf '%s\n' 'The NSE market-day scheduler runs in this server. Press Ctrl+C to stop.'
-export TRADINGAGENTS_QUICK_TUNNEL=0
-exec "$python" -m uvicorn tradingagents.dashboard.api:app --host 127.0.0.1 --port "$port" --no-access-log
+exec "$python" -m tradingagents.dashboard.launcher "$port" "$mode"

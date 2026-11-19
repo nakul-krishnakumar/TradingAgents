@@ -99,6 +99,14 @@ def terminate(process):
             process.wait()
 
 
+def start_dashboard(port, *, env):
+    return subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "tradingagents.dashboard.api:app",
+         "--host", "127.0.0.1", "--port", str(port), "--no-access-log"],
+        env=env,
+    )
+
+
 def main(port):
     cloudflared = cloudflared_path()
     password = tunnel_password()
@@ -111,11 +119,7 @@ def main(port):
 
     signal.signal(signal.SIGTERM, stop)
     try:
-        server = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "tradingagents.dashboard.api:app",
-             "--host", "127.0.0.1", "--port", str(port), "--no-access-log"],
-            env=env,
-        )
+        server = start_dashboard(port, env=env)
         wait_for_auth(server, port)
         print("Open the HTTPS URL Cloudflare prints. Sign in as marketdesk using the tunnel password in .env.", flush=True)
         # Keep the Quick Tunnel independent of a named tunnel's configuration.

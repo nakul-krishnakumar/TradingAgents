@@ -39,3 +39,15 @@ def test_generated_password_stays_in_dotenv(monkeypatch, tmp_path, capsys):
     assert tunnel_password() == first
     assert first in (tmp_path / ".env").read_text(encoding="utf-8")
     assert first not in capsys.readouterr().out
+
+
+def test_tunnel_uses_user_defined_password(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    password = secrets.token_urlsafe(24) + "#${TUNNEL_TEST_LITERAL}"
+    config = f"TRADINGAGENTS_TUNNEL_PASSWORD='{password}'\n"
+    path = tmp_path / ".env"
+    path.write_text(config, encoding="utf-8")
+
+    assert tunnel_password() == password
+    assert path.read_text(encoding="utf-8") == config
+    assert not capsys.readouterr().out

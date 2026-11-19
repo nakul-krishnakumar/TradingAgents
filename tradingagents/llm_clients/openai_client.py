@@ -7,11 +7,15 @@ from typing import Any
 from urllib.parse import urlparse
 
 from langchain_core.messages import AIMessage
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.utils.function_calling import convert_to_openai_function
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel
 
 from .api_key_env import get_api_key_env
 from .base_client import BaseLLMClient, normalize_content
 from .capabilities import get_capabilities
+from .codex_config import PROVIDER as CODEX, bridge_timeout, bridge_url
 from .validators import validate_model
 
 logger = logging.getLogger(__name__)
@@ -73,6 +77,29 @@ class LocalCompatibleChatOpenAI(NormalizedChatOpenAI):
 
 
 SARVAM_CHAT_BASE_URL = "https://api.sarvam.ai/v2"
+
+
+class CodexChatOpenAI(NormalizedChatOpenAI):
+    """Use Codex's native output-schema constraint and keep its streamed summaries."""
+
+    def with_structured_output(self, schema, *, method=None, **kwargs):
+        if method in (None, "json_schema") and not kwargs and isinstance(schema, type) and issubclass(schema, BaseModel):
+            function = convert_to_openai_function(schema, strict=True)
+            response_format = {"type": "json_schema", "json_schema": {
+                "name": function["name"], "schema": function["parameters"], "strict": True,
+            }}
+            # Keep the normal Chat Completions stream, including the usage and
+            # summary chunks. Validate the final JSON with the caller's model.
+            return self.bind(extra_body={"response_format": response_format}) | PydanticOutputParser(pydantic_object=schema)
+        return super().with_structured_output(schema, method=method or "json_schema", **kwargs)
+
+    def _convert_chunk_to_generation_chunk(self, chunk, default_chunk_class, base_generation_info):
+        generation = super()._convert_chunk_to_generation_chunk(chunk, default_chunk_class, base_generation_info)
+        choices = chunk.get("choices") or []
+        summary = (choices[0].get("delta") or {}).get("reasoning_summary") if choices else None
+        if generation is not None and isinstance(summary, str) and summary:
+            generation.message.additional_kwargs["codex_reasoning_summary"] = summary
+        return generation
 
 
 class SarvamStreamingChatOpenAI(LocalCompatibleChatOpenAI):
@@ -308,6 +335,7 @@ OPENAI_COMPATIBLE_PROVIDERS: dict[str, ProviderSpec] = {
     "chatgpt":    ProviderSpec(base_url="https://api.openai.com/v1", chat_class=ChatGPTPlanChatOpenAI,
                                use_responses_api=True, credential=_chatgpt_credential,
                                pinned_base_url=True),
+    CODEX:       ProviderSpec(chat_class=CodexChatOpenAI),
     # Generic endpoint: user supplies base_url; key optional (keyless local).
     "openai_compatible": ProviderSpec(
         require_base_url=True, key_optional=True, chat_class=LocalCompatibleChatOpenAI
@@ -321,6 +349,8 @@ SIGNED_IN_PROVIDERS = tuple(key for key, spec in OPENAI_COMPATIBLE_PROVIDERS.ite
 
 def check_endpoint(provider: str, base_url: str | None) -> None:
     """Raise ValueError when a provider pinned to its own endpoint is pointed elsewhere."""
+    if provider.lower() == CODEX and base_url and base_url.rstrip("/") != bridge_url():
+        raise ValueError(f"Codex connects to {bridge_url()}; set TRADINGAGENTS_CODEX_PORT to change its port.")
     spec = OPENAI_COMPATIBLE_PROVIDERS.get(provider.lower())
     if spec is not None and spec.pinned_base_url and base_url and base_url != spec.base_url:
         raise ValueError(f"Provider '{provider}' only connects to {spec.base_url}; "
@@ -383,6 +413,9 @@ class OpenAIClient(BaseLLMClient):
             env_base_url = os.environ.get(spec.base_url_env) if spec.base_url_env else None
             base_url = self.base_url or env_base_url or spec.base_url
             check_endpoint(self.provider, base_url)
+            if self.provider == CODEX:
+                base_url = bridge_url()
+                llm_kwargs.update(timeout=bridge_timeout() + 35.0, max_retries=0, use_responses_api=False)
             if spec.require_base_url and not base_url:
                 raise ValueError(
                     f"Provider '{self.provider}' requires a base_url. Set it via "

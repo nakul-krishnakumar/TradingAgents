@@ -33,6 +33,9 @@ def _output_parts(message):
     trace = message.additional_kwargs.get("sarvam_reasoning")
     if isinstance(trace, str) and trace:
         yield "reasoning", trace
+    summary = message.additional_kwargs.get("codex_reasoning_summary")
+    if isinstance(summary, str) and summary:
+        yield "summary", summary
 
 
 def _agent_name(metadata):

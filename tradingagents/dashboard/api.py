@@ -27,6 +27,7 @@ from tradingagents.default_config import build_default_config
 from tradingagents.memory import TradingMemoryLog
 from tradingagents.reporting import research_summary
 
+from .codex_service import managed_bridge
 from .daily_desk import DailyBudget, DailyDesk
 from .daily_paper import AutoTradeSettings
 from .jobs import BacktestRequest, JobStore, ResearchRequest, provider_status, validate_analysts
@@ -68,12 +69,13 @@ async def lifespan(_app):
     with locked(JOBS.directory / "worker", wait=False) as acquired:
         if not acquired:
             raise RuntimeError("A dashboard process already owns this results directory.")
-        JOBS.start()
-        DAILY.start()
-        try:
-            yield
-        finally:
-            DAILY.stop()
+        with managed_bridge(CONFIG):
+            JOBS.start()
+            DAILY.start()
+            try:
+                yield
+            finally:
+                DAILY.stop()
 
 
 app = FastAPI(title="TradingAgents Dashboard", lifespan=lifespan, docs_url=None, redoc_url=None)

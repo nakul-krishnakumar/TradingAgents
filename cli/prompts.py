@@ -13,6 +13,7 @@ from cli.display import console
 from cli.models import AnalystType, AssetType
 from tradingagents.dataflows.symbols import safe_ticker_component
 from tradingagents.llm_clients.api_key_env import get_api_key_env
+from tradingagents.llm_clients.codex_config import PROVIDER as CODEX, bridge_url
 from tradingagents.llm_clients.model_catalog import get_model_options
 from tradingagents.llm_clients.openai_client import OPENAI_COMPATIBLE_PROVIDERS, SIGNED_IN_PROVIDERS
 
@@ -387,6 +388,7 @@ def _llm_provider_table() -> list[tuple[str, str, str | None]]:
     return [
         ("OpenAI", "openai", "https://api.openai.com/v1"),
         ("Google", "google", None),
+        ("OpenAI Codex (local bridge)", CODEX, None),
         ("Anthropic", "anthropic", "https://api.anthropic.com/"),
         ("ChatGPT (Plus or Pro plan)", "chatgpt", "https://api.openai.com/v1"),
         ("xAI", "xai", "https://api.x.ai/v1"),
@@ -411,6 +413,8 @@ def _llm_provider_table() -> list[tuple[str, str, str | None]]:
 def provider_default_url(provider_key: str) -> str | None:
     """Return the default backend URL for a provider key, or None if unknown."""
     key = provider_key.lower()
+    if key == CODEX:
+        return bridge_url()
     for _, pk, url in _llm_provider_table():
         if pk == key:
             return url

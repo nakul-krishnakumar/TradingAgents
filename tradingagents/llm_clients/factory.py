@@ -2,6 +2,7 @@
 from typing import Any
 
 from .base_client import BaseLLMClient
+from .codex_config import PROVIDER as CODEX
 
 
 def create_llm_client(
@@ -155,10 +156,12 @@ def create_tier_client(config: dict, tier: str, **extra) -> BaseLLMClient:
     if config.get("stream_model_output"):
         if provider == "google":
             kwargs.update(streaming=True, include_thoughts=True)
+        elif provider == CODEX:
+            kwargs.update(streaming=True, stream_usage=True)
         elif provider == "openai_compatible":
             from .openai_client import SARVAM_CHAT_BASE_URL
 
             if (base_url or "").rstrip("/") == SARVAM_CHAT_BASE_URL:
                 kwargs.update(streaming=True, stream_usage=True)
-    return create_llm_client(provider=provider, model=config[f"{tier}_think_llm"], base_url=base_url,
-                             **kwargs, **extra)
+    kwargs.update(extra)
+    return create_llm_client(provider=provider, model=config[f"{tier}_think_llm"], base_url=base_url, **kwargs)

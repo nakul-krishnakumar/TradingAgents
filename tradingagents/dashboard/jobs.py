@@ -85,7 +85,7 @@ def provider_status(config: dict) -> dict:
         key = get_api_key_env(provider)
         url = config.get(f"{tier}_think_backend_url") or config.get("backend_url") or ""
         label = "Sarvam" if provider == "openai_compatible" and url.rstrip("/") == "https://api.sarvam.ai/v2" else {
-            "google": "Google Gemini", "openai": "OpenAI",
+            "google": "Google Gemini", "openai": "OpenAI", "codex": "OpenAI Codex",
         }.get(provider, provider.replace("_", " ").title())
         required = provider not in ("chatgpt", "ollama", "bedrock", "openai_compatible") or label == "Sarvam"
         tiers[tier] = {

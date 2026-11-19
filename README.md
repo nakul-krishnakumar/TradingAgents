@@ -224,9 +224,11 @@ baskets, market trends, price and NAV charts, multi-agent research, report
 history, and decision backtests. The browser connects to TradingAgents on
 loopback. Python loads provider keys from the project's `.env`.
 
-To set up another machine, install Git, Python 3.11+ (3.13 recommended), and
-Node.js 20.19+ or 22.12+ with npm. Clone the GitHub repository that contains
-your Market Desk changes:
+To set up another machine, install Git and Python 3.11+ (3.13 recommended).
+On x64 and arm64 Linux and macOS, the launcher downloads Node.js 24 LTS with npm
+into `.venv` if a compatible installation is missing. On other platforms, put
+Node.js 24 LTS and npm on your `PATH` before starting. Clone the GitHub
+repository that contains your Market Desk changes:
 
 ```bash
 git clone https://github.com/YOUR_ACCOUNT/TradingAgents.git
@@ -251,15 +253,24 @@ git pull --ff-only
 ./run.sh
 ```
 
-To open Market Desk from another device, stop any existing instance and run:
+To open Market Desk from another device, stop any existing instance. Add or
+replace this line in the server's `.env` with your own password of at least
+16 characters. If the setting is empty, the launcher generates a password
+and saves it there on first use.
+
+```dotenv
+TRADINGAGENTS_TUNNEL_PASSWORD='your-own-long-unique-password'
+```
+
+Start the tunnel:
 
 ```bash
 ./run.sh --tunnel
 ```
 
-Open the HTTPS address printed by Cloudflare. Sign in as `marketdesk` with
-`TRADINGAGENTS_TUNNEL_PASSWORD` from the server's `.env`. The launcher generates
-this password on first use. It uses `cloudflared` from your PATH or downloads
+Open the HTTPS address printed by Cloudflare and sign in as `marketdesk` with
+the password from `.env`. Restart the launcher after changing the password.
+The launcher uses `cloudflared` from your PATH or downloads
 Cloudflare's binary into the ignored local environment on supported platforms.
 The free Quick Tunnel address is temporary and changes on restart. Keep the
 server and tunnel running while you need the address. [Cloudflare Quick Tunnels](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
@@ -294,6 +305,70 @@ reports start with a TL;DR of the main findings, counterpoint, and decision.
   and corporate disclosures. Local votes and available samples of Stocktwits
   labels have their own counts and coverage. Research model keys are required
   for agent runs. These pages can use their public data feeds without new keys.
+
+#### Use Codex for both model tiers
+
+Install the Codex CLI on the same machine and under the same user that runs
+Market Desk. For a personal installation, sign in with `codex login`. On a
+headless machine, use `codex login --device-auth`. For a hosted or shared
+deployment, use an OpenAI Platform key in `CODEX_API_KEY` in `.env`.
+[Codex authentication](https://learn.chatgpt.com/docs/non-interactive-mode#authenticate-in-automation)
+
+```bash
+npm install -g @openai/codex
+codex login status
+```
+
+Set these in `.env`. Generate the bridge key with
+`python3 -c 'import secrets; print(secrets.token_urlsafe(32))'` and paste it into
+the last line. Sol runs the analysts, debaters, and trader. Astra runs the
+Research Manager and Portfolio Manager. If switching providers, remove the
+previous backend URL settings for Codex tiers so they resolve the local bridge.
+
+```dotenv
+TRADINGAGENTS_LLM_PROVIDER=codex
+TRADINGAGENTS_QUICK_THINK_PROVIDER=codex
+TRADINGAGENTS_QUICK_THINK_LLM=gpt-6.2-sol
+TRADINGAGENTS_DEEP_THINK_PROVIDER=codex
+TRADINGAGENTS_DEEP_THINK_LLM=gpt-6.2-astra
+TRADINGAGENTS_CODEX_MODELS=gpt-6.2-sol,gpt-6.2-astra
+TRADINGAGENTS_CODEX_REASONING_EFFORT=max
+TRADINGAGENTS_CODEX_SERVICE_TIER=ultrafast
+TRADINGAGENTS_CODEX_BRIDGE_KEY=
+```
+
+Start Market Desk with `./run.sh` or `./run.sh --tunnel`. When a Codex tier is
+configured, the launcher brings up the FastAPI bridge at
+`http://127.0.0.1:8766/v1` before starting Market Desk and stops the services
+it started on shutdown. The bridge requires the bearer key and listens on
+loopback. The tunnel serves Market Desk on its separate port.
+For CLI-only use, start it in a separate terminal with
+`.venv/bin/python -m tradingagents.dashboard.codex_bridge` before running
+TradingAgents. A compatible client can use `GET /v1/models` and
+`POST /v1/chat/completions` for text, JSON Schema output, and function calls.
+TradingAgents executes its existing data tools when Codex requests them.
+`TRADINGAGENTS_CODEX_MODELS` is a comma-separated list of model IDs. Existing
+single-model setups can use `TRADINGAGENTS_CODEX_MODEL` in its place.
+
+The bridge defaults to `max` reasoning and requests Ultrafast for both models.
+Access to Ultrafast depends on the model and account.
+Codex uses the default speed for tiers outside the model's catalog. Ultrafast
+can use more of your allowance or change the API rate. Set
+`TRADINGAGENTS_CODEX_SERVICE_TIER=fast` to request Fast, or set it to an empty
+value to use Standard. [Speed and availability](https://learn.chatgpt.com/docs/agent-configuration/speed)
+
+The bridge uses compact research instructions and an ephemeral `codex exec`
+session for each request, with up to three concurrent requests by default. The
+model log records token counts and any thought summaries Codex emits. Final text
+appears in one piece. Output token limits are passed as prompt guidance. Set
+`TRADINGAGENTS_CODEX_BINARY` to the installed executable if your `codex` command
+downloads packages on each call.
+
+The Codex SDK and App Server suit a persistent research chat that resumes
+conversations or needs token deltas and interruption. The native Responses API
+is another option when you want direct API calls and API billing. The bridge
+uses `codex exec` for Market Desk's independent agent calls.
+[Codex integration options](https://developers.openai.com/blog/codex-as-a-platform)
 
 #### Daily trading desk
 
@@ -347,6 +422,7 @@ SARVAM_API_KEY=your_sarvam_key
 SARVAM_MODEL=deepseekv4.1-flash-1017
 OPENAI_COMPATIBLE_API_KEY=${SARVAM_API_KEY}
 TRADINGAGENTS_LLM_PROVIDER=google
+TRADINGAGENTS_QUICK_THINK_PROVIDER=google
 TRADINGAGENTS_QUICK_THINK_LLM=gemini-4-hydrogen
 TRADINGAGENTS_GOOGLE_THINKING_LEVEL=high
 TRADINGAGENTS_DEEP_THINK_PROVIDER=openai_compatible

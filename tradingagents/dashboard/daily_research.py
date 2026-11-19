@@ -12,7 +12,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from tradingagents.dataflows.vendors import india_intraday as provider
-from tradingagents.llm_clients.factory import create_tier_client
+from tradingagents.llm_clients.codex_config import PROVIDER as CODEX
+from tradingagents.llm_clients.factory import create_tier_client, tier_provider
 
 from .daily_strategy import (
     CLOSED_STATES,
@@ -71,7 +72,9 @@ def daily_brief(candidates, filings, config, log_file, skill, premarket, sources
     ]
     for tier in enabled:
         try:
-            llm = create_tier_client({**config, "llm_max_retries": 0, "max_tokens": 3000}, tier, timeout=30).get_llm()
+            timeout = 90 if tier_provider(config, tier) == CODEX else 30
+            llm = create_tier_client({**config, "llm_max_retries": 0, "max_tokens": 3000, "stream_model_output": True},
+                                     tier, timeout=timeout).get_llm()
             note = llm.with_structured_output(BriefText).invoke(
                 messages, config={"callbacks": [logger_callback],
                                   "metadata": {"langgraph_node": "Daily trading premarket research"}},

@@ -152,5 +152,13 @@ def create_tier_client(config: dict, tier: str, **extra) -> BaseLLMClient:
     else:
         base_url = config.get(f"{tier}_think_backend_url")
     kwargs = build_llm_kwargs({**config, "llm_provider": provider})
+    if config.get("stream_model_output"):
+        if provider == "google":
+            kwargs.update(streaming=True, include_thoughts=True)
+        elif provider == "openai_compatible":
+            from .openai_client import SARVAM_CHAT_BASE_URL
+
+            if (base_url or "").rstrip("/") == SARVAM_CHAT_BASE_URL:
+                kwargs.update(streaming=True, stream_usage=True)
     return create_llm_client(provider=provider, model=config[f"{tier}_think_llm"], base_url=base_url,
                              **kwargs, **extra)

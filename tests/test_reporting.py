@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
-from tradingagents.reporting import write_report_tree
+from tradingagents.reporting import research_summary, write_report_tree
 
 
 def _state():
@@ -173,3 +173,25 @@ def test_the_header_names_the_analysts_as_users_select_them(tmp_path):
     page = (tmp_path / "complete_report.html").read_text(encoding="utf-8")
     fields = re.findall(r'<span class="field">([^<]*)</span>', page)
     assert {"market", "sentiment", "news"} <= set(fields) and "social" not in page
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("heading", ["**Executive Summary**:", "**Executive Summary:**", "### Executive Summary\n", "TL;DR:"])
+def test_tldr_reads_saved_portfolio_manager_summary(heading):
+    decision = f"**Rating**: Hold\n\n{heading} Breakout evidence is mixed.\n\n**Investment Thesis**: More detail."
+    assert research_summary(decision) == "Breakout evidence is mixed."
+
+
+@pytest.mark.unit
+def test_reports_show_tldr_before_analyst_sections(tmp_path):
+    summary = "Volume rose, but the source could not confirm ownership or intent."
+    state = dict(_state(), final_trade_decision=(
+        f"**Rating**: Hold\n\n**Executive Summary**: {summary}\n\n"
+        "**Investment Thesis**: Check whether the volume persists."
+    ))
+    markdown = write_report_tree(state, "AAPL", tmp_path).read_text()
+    html = (tmp_path / "complete_report.html").read_text()
+    assert markdown.index(f"## TL;DR\n\n{summary}") < markdown.index("## I. Analyst Team Reports")
+    assert f'<section id="tldr"><h2>TL;DR</h2><p>{summary}</p>' in html
+    assert html.index('<section id="tldr">') < html.index('<section id="s1">')
+    assert research_summary("**Rating**: Hold\n\nNo labeled summary.") == ""

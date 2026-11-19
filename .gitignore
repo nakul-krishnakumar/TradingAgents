@@ -149,7 +149,14 @@ activemq-data/
 
 # Environments
 .env
+.env.*
+!.env.example
+!.env.*.example
 .envrc
+*.pem
+*.key
+*.p12
+*.pfx
 .venv
 env/
 venv/
@@ -218,6 +225,11 @@ __marimo__/
 # Cache
 **/data_cache/
 
-# Enterprise env file (secrets) and generated run reports
-.env.enterprise
+# Generated run reports and local workspace state
 reports/
+/.tradingagents/
+/logs/
+
+# Local dashboard build artifacts
+/web/node_modules/
+/web/dist/

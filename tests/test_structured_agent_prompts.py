@@ -58,6 +58,29 @@ def test_trader_prompt_states_constraint():
 
 
 @pytest.mark.unit
+def test_trader_omits_exchange_price_levels_for_nav_only_fund():
+    from tradingagents.agents.schemas import TraderAction, TraderProposal
+
+    captured = {}
+    llm = _capturing_llm(captured, TraderProposal(
+        action=TraderAction.HOLD, reasoning="Maintain allocation while monitoring drawdown.",
+        entry_price=71.2, stop_loss=69.0,
+    ))
+    result = create_trader(llm)({
+        "company_of_interest": "AMFI-122639",
+        "asset_type": "fund",
+        "investment_plan": "**Recommendation**: Hold",
+        "market_report": "Latest daily NAV is INR 71.2.",
+    })
+    prompt = _prompt_text(captured["prompt"])
+    assert "Fund NAV Report:" in prompt
+    assert "subscriptions or redemptions" in prompt
+    assert "absolute price levels" not in prompt
+    assert "**Entry Price**" not in result["trader_investment_plan"]
+    assert "**Stop Loss**" not in result["trader_investment_plan"]
+
+
+@pytest.mark.unit
 def test_research_manager_prompt_states_constraint():
     from tradingagents.agents.schemas import PortfolioRating, ResearchPlan
 
@@ -70,16 +93,19 @@ def test_research_manager_prompt_states_constraint():
     )
     create_research_manager(llm)({
         "company_of_interest": "NVDA",
+        "market_report": "The upper Bollinger Band is 196.5.",
         "investment_debate_state": {
             "history": "h", "bull_history": "b", "bear_history": "r",
             "current_response": "", "count": 1,
         },
     })
     assert NO_EXTERNAL_TOOLS in _prompt_text(captured["prompt"])
+    assert "The upper Bollinger Band is 196.5." in _prompt_text(captured["prompt"])
 
 
 @pytest.mark.unit
-def test_portfolio_manager_prompt_states_constraint():
+@pytest.mark.parametrize("asset_type", ["stock", "fund"])
+def test_portfolio_manager_prompt_states_constraint(asset_type):
     from tradingagents.agents.schemas import PortfolioDecision, PortfolioRating
 
     captured = {}
@@ -89,6 +115,7 @@ def test_portfolio_manager_prompt_states_constraint():
             rating=PortfolioRating.HOLD,
             executive_summary="x",
             investment_thesis="y",
+            price_target=190.0,
         ),
     )
     risk = {
@@ -97,13 +124,19 @@ def test_portfolio_manager_prompt_states_constraint():
         "current_conservative_response": "", "current_neutral_response": "",
         "latest_speaker": "Neutral", "count": 1,
     }
-    create_portfolio_manager(llm)({
+    result = create_portfolio_manager(llm)({
         "company_of_interest": "NVDA",
+        "asset_type": asset_type,
+        "market_report": "Observed market data as of the analysis date.",
         "risk_debate_state": risk,
         "investment_plan": "plan",
         "trader_investment_plan": "trader plan",
     })
-    assert NO_EXTERNAL_TOOLS in _prompt_text(captured["prompt"])
+    prompt = _prompt_text(captured["prompt"])
+    assert NO_EXTERNAL_TOOLS in prompt
+    assert "Observed market data as of the analysis date." in prompt
+    displayed_target = "190.0" if asset_type == "stock" else "not provided"
+    assert f"**Price Target**: {displayed_target}" in result["final_trade_decision"]
 
 
 @pytest.mark.unit

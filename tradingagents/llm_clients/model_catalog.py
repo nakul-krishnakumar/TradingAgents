@@ -124,6 +124,7 @@ MODEL_OPTIONS: ProviderModeOptions = {
     },
     "google": {
         "quick": [
+            ("Gemini 4 Hydrogen - Agentic workflows and reasoning", "gemini-4-hydrogen"),
             ("Gemini 3.8 Flash - Most capable Flash", "gemini-3.8-flash"),
             ("Gemini 3.5 Flash Lite - Fast and cost-efficient", "gemini-3.5-flash-lite"),
             ("Gemini 3.1 Flash Lite - Most cost-efficient", "gemini-3.1-flash-lite"),

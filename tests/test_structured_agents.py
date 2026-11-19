@@ -119,7 +119,7 @@ class TestNullishFloatCoercion:
             action=TraderAction.BUY,
             reasoning="x",
             entry_price="$1,234.50",
-            stop_loss="1,180",
+            stop_loss="₹1,180",
         )
         assert p.entry_price == 1234.50
         assert p.stop_loss == 1180.0

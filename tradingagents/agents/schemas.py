@@ -51,7 +51,7 @@ def _coerce_optional_float(value):
     text = value.strip()
     if text.lower() in _NULLISH_FLOAT or text.endswith("%"):
         return None
-    cleaned = text.replace(",", "").lstrip("$€£¥").strip()
+    cleaned = text.replace(",", "").lstrip("$€£¥₹").strip()
     try:
         return float(cleaned)
     except ValueError:
@@ -188,7 +188,7 @@ class TraderProposal(BaseModel):
         return _coerce_optional_float(v)
 
 
-def render_trader_proposal(proposal: TraderProposal) -> str:
+def render_trader_proposal(proposal: TraderProposal, *, show_trade_levels: bool = True) -> str:
     """Render a TraderProposal to markdown.
 
     The trailing ``FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL**`` line is
@@ -202,9 +202,11 @@ def render_trader_proposal(proposal: TraderProposal) -> str:
     ]
     # Named even when absent, so a reader can tell a level the trader chose not
     # to give from one the schema never asked for.
-    for label, value in (("Entry Price", proposal.entry_price),
-                         ("Stop Loss", proposal.stop_loss),
-                         ("Position Sizing", proposal.position_sizing)):
+    fields = []
+    if show_trade_levels:
+        fields.extend([("Entry Price", proposal.entry_price), ("Stop Loss", proposal.stop_loss)])
+    fields.append(("Position Sizing", proposal.position_sizing))
+    for label, value in fields:
         parts.extend(["", f"**{label}**: {value if value is not None and value != '' else 'not provided'}"])
     parts.extend([
         "",
@@ -216,6 +218,14 @@ def render_trader_proposal(proposal: TraderProposal) -> str:
 # ---------------------------------------------------------------------------
 # Portfolio Manager
 # ---------------------------------------------------------------------------
+
+
+RESEARCH_SUMMARY_GUIDANCE = (
+    "In three or four concise sentences, answer the user's research question if provided "
+    "and synthesize the decisive findings across the available analyst reports and debate. "
+    "Include the strongest counterargument or material evidence gap and explain the practical "
+    "implication of the final rating, or what would change it. Use only supported evidence."
+)
 
 
 class PortfolioDecision(BaseModel):
@@ -237,12 +247,7 @@ class PortfolioDecision(BaseModel):
             "support a call."
         ),
     )
-    executive_summary: str = Field(
-        description=(
-            "A concise action plan covering entry strategy, position sizing, "
-            "key risk levels, and time horizon. Two to four sentences."
-        ),
-    )
+    executive_summary: str = Field(description=RESEARCH_SUMMARY_GUIDANCE)
     investment_thesis: str = Field(
         description=(
             "Detailed reasoning anchored in specific evidence from the analysts' "
@@ -252,7 +257,10 @@ class PortfolioDecision(BaseModel):
     )
     price_target: float | None = Field(
         default=None,
-        description="Optional target price in the instrument's quote currency.",
+        description=(
+            "Optional target price in the instrument's quote currency, supplied only when "
+            "the thesis explains a supported method. Cite third-party estimates separately."
+        ),
     )
     time_horizon: str | None = Field(
         default=None,

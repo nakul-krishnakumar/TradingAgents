@@ -201,6 +201,19 @@ def report_or_absent(text: str, source: str) -> str:
     return f"(No {source} report in this run: it is not available, not an empty finding.)"
 
 
+def get_analyst_evidence_from_state(state: Mapping[str, Any]) -> str:
+    """Give decision agents the original reports alongside the debate."""
+    reports = (
+        ("Market Analyst", "market_report"),
+        ("Fundamentals Analyst", "fundamentals_report"),
+        ("News Analyst", "news_report"),
+        ("Sentiment Analyst", "sentiment_report"),
+    )
+    return "\n\n".join(
+        f"**{name}:**\n{report_or_absent(state.get(key, ''), name)}" for name, key in reports
+    )
+
+
 def get_portfolio_context_from_state(state: Mapping[str, Any]) -> str:
     """Return the caller's portfolio block, or a notice that none was given.
 

@@ -24,6 +24,7 @@ def create_trader(llm):
         company_name = state["company_of_interest"]
         instrument_context = get_instrument_context_from_state(state)
         investment_plan = state["investment_plan"]
+        is_fund = state.get("asset_type") == "fund"
         # The research plan digests the debate but loses exact price structure;
         # give the Trader the technical market report so entry/stop levels are
         # grounded in real ATR / support-resistance / current price (#1167). The
@@ -32,16 +33,30 @@ def create_trader(llm):
         market_report = (state["market_report"] or "").strip()
         portfolio_context = get_portfolio_context_from_state(state)
 
-        if market_report:
+        if is_fund:
             grounding = (
-                "Ground concrete price levels (entry, stop-loss, position sizing) in the technical "
-                "market report's price structure -- current price, support/resistance, ATR, and "
-                "volatility -- and use the research plan for direction and strategy. "
+                "Use the daily NAV evidence to discuss subscriptions or redemptions, "
+                "allocation, and what should trigger a review. Omit entry price, stop loss, "
+                "and exchange orders for a NAV-priced fund. "
             )
-            report_section = f"Technical Market Report:\n{market_report}\n\n"
+            report_section = f"Fund NAV Report:\n{market_report}\n\n" if market_report else ""
+            optional_fields = "- **Position Sizing**: when the evidence supports it"
         else:
-            grounding = ""
+            grounding = (
+                "State entry price and stop-loss as absolute price levels in the "
+                "instrument's quote currency (for example 189.5), never a percentage "
+                "or a range. Convert a percentage distance only if the report supplies the "
+                "reference price. Give a level only when the available market evidence supports it. "
+            )
             report_section = ""
+            optional_fields = "- **Entry Price**, **Stop Loss**, **Position Sizing**: when supported"
+            if market_report:
+                grounding += (
+                    "Ground concrete price levels (entry, stop-loss, position sizing) in the technical "
+                    "market report's price structure -- current price, support/resistance, ATR, and "
+                    "volatility -- and use the research plan for direction and strategy. "
+                )
+                report_section = f"Technical Market Report:\n{market_report}\n\n"
 
         messages = [
             {
@@ -50,13 +65,6 @@ def create_trader(llm):
                     "You are a trading agent analyzing market data to make investment decisions. "
                     "Based on your analysis, provide a specific recommendation to buy, sell, or hold. "
                     + grounding
-                    # Entry/stop are numeric price fields. Asking for concrete
-                    # levels invites a percentage ("15%"), which is not a price
-                    # and fails the structured parse (#1288).
-                    + "State entry price and stop-loss as absolute price levels in the "
-                    "instrument's quote currency (for example 189.5), never a percentage "
-                    "or a range; convert a percentage distance to the price level it "
-                    "implies, or omit the field if you cannot state a number. "
                     + NO_EXTERNAL_TOOLS
                     + get_language_instruction()
                 ),
@@ -76,8 +84,8 @@ def create_trader(llm):
                     "- **Action**: exactly one of Buy / Hold / Sell. A research "
                     "recommendation of Overweight is a Buy and Underweight is a Sell, "
                     "sized by how strong the case is; conflict alone is not a Hold.\n"
-                    "- **Reasoning**: why, against the plan and the price structure\n"
-                    "- **Entry Price**, **Stop Loss**, **Position Sizing**: when you can state them"
+                    "- **Reasoning**: why, against the plan and the available market evidence\n"
+                    f"{optional_fields}"
                 ),
             },
         ]
@@ -86,7 +94,7 @@ def create_trader(llm):
             structured_llm,
             llm,
             messages,
-            render_trader_proposal,
+            lambda proposal: render_trader_proposal(proposal, show_trade_levels=not is_fund),
             "Trader",
         )
 

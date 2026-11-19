@@ -162,7 +162,7 @@ def test_empty_body_still_passes_through(monkeypatch):
 def test_request_error_message_carries_no_key(monkeypatch):
     # Alpha Vantage also sends its key in the URL (#1324).
     import requests
-    key = "AVKEY1234567890XYZ"
+    key = "AV" * 9
     monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", key)
 
     def boom(*a, **k):

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from tradingagents.agents.context import get_instrument_context_from_state, get_language_instruction
+from tradingagents.agents.context import (
+    get_analyst_evidence_from_state,
+    get_instrument_context_from_state,
+    get_language_instruction,
+)
 from tradingagents.agents.schemas import ResearchPlan, render_research_plan
 from tradingagents.agents.structured import (
     NO_EXTERNAL_TOOLS,
@@ -39,6 +43,11 @@ The debate always contains conflicting arguments; deciding which side is stronge
 
 **Debate History:**
 {history}
+
+**Original analyst reports:**
+{get_analyst_evidence_from_state(state)}
+
+Check the debate's decisive claims against the original reports. Name the supporting report and preserve the dates, units, and attribution it provides. Treat conclusions about who traded or why volume rose as hypotheses unless the evidence identifies participants or causes. Mark conflicts and missing evidence explicitly.
 
 ## Output
 

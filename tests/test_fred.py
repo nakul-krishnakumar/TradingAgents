@@ -258,7 +258,7 @@ if __name__ == "__main__":
     unittest.main()
 
 
-_KEY = "abcdef0123456789abcdef0123456789"
+_KEY = "0" * 32
 
 
 @pytest.mark.unit

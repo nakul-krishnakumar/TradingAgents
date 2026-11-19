@@ -217,6 +217,151 @@ At start-up the interactive CLI mentions a newer release and notices from Tauric
 
 A saved report also includes `complete_report.html`, the report as one page with its sections listed beside the text, for reading in a browser, on a phone or in print. Answering the save question at the prompt also asks about the page and can open it in your browser; `--no-html` skips it, and so does `ta.save_reports(state, "NVDA", html=False)` from Python.
 
+### Local browser workspace
+
+Market Desk is a React workspace for Indian-market screening, wishlists, paper
+baskets, market trends, price and NAV charts, multi-agent research, report
+history, and decision backtests. The browser connects to TradingAgents on
+loopback. Python loads provider keys from the project's `.env`.
+
+To set up another machine, install Git, Python 3.11+ (3.13 recommended), and
+Node.js 20.19+ or 22.12+ with npm. Clone the GitHub repository that contains
+your Market Desk changes:
+
+```bash
+git clone https://github.com/YOUR_ACCOUNT/TradingAgents.git
+cd TradingAgents
+cp .env.example .env
+chmod 600 .env
+# Add your provider settings and keys to .env locally.
+./run.sh
+```
+
+The launcher installs Python packages from `requirements.txt` and frontend
+packages from `web/package-lock.json`. It builds the browser app and starts the
+backend and the NSE market-day scheduler in the same process. Keep it running
+for scheduled work. Use `TRADINGAGENTS_PORT=8767 ./run.sh` for an alternate port.
+Keep actual credentials in `.env`, which Git ignores.
+
+For an existing checkout, stop the running server, update the code, and launch
+again:
+
+```bash
+git pull --ff-only
+./run.sh
+```
+
+To open Market Desk from another device, stop any existing instance and run:
+
+```bash
+./run.sh --tunnel
+```
+
+Open the HTTPS address printed by Cloudflare. Sign in as `marketdesk` with
+`TRADINGAGENTS_TUNNEL_PASSWORD` from the server's `.env`. The launcher generates
+this password on first use. It uses `cloudflared` from your PATH or downloads
+Cloudflare's binary into the ignored local environment on supported platforms.
+The free Quick Tunnel address is temporary and changes on restart. Keep the
+server and tunnel running while you need the address. [Cloudflare Quick Tunnels](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+
+Open [Market Desk](http://127.0.0.1:8765) and search by Yahoo ticker, fund name, or
+AMFI scheme code. In **Research runs**, open a run's **Model log** for live chat
+output, provider-supplied reasoning or thought summaries, tool calls, and token
+usage. Counts become available when the provider reports usage. The JSONL
+download is also saved in the run directory as `model_log.jsonl`. Completed
+reports start with a TL;DR of the main findings, counterpoint, and decision.
+
+- **Screener** covers NSE shares, ETFs, listed bonds, REITs and InvITs along
+  with AMFI mutual fund plans. Filter by sector, category, issuer, plan, option,
+  and numeric ranges. Price, turnover, delivery, P/E and 52-week ranges draw
+  from [NSE reports](https://www.nseindia.com/all-reports). AMFI provides
+  [NAV history](https://www.amfiindia.com/net-asset-value/nav-download) and
+  [Direct and Regular plan expenses](https://www.amfiindia.com/ter-of-mf-schemes)
+  where the plan can be matched. Bond terms include [NSDL-reported ratings](https://nsdl.com/resources/data/detailed-list-debt-instruments)
+  when available. Profit and loss presets query the Yahoo
+  equity screener. **Load more metrics** retrieves company profiles and
+  instrument history in batches for the current search. NSE's bulk price
+  returns use unadjusted closes. Individual research charts use adjusted bars.
+- **Wishlists** stores named lists of instruments in the local workspace. Save
+  results from the Screener or from an instrument's research panel.
+- **Paper baskets** lets you assign target weights, simulate buys and sells,
+  and track cash, holdings, cost, and realized or unrealized P&L. Fills use a
+  dated reference quote, published NAV, or entered INR price. The related
+  [trending smallcases](https://www.smallcase.com/collection/6a952801e2300b11a1484495)
+  are publisher links. Basket weights and paper fills are your own.
+- **Market trends** shows [NSE breadth, sector moves and India VIX](https://www.nseindia.com/market-data/live-equity-market),
+  stock and ETF volume and price activity, AMFI NAV movers, [FII/DII flows](https://www.nseindia.com/reports/fii-dii),
+  and corporate disclosures. Local votes and available samples of Stocktwits
+  labels have their own counts and coverage. Research model keys are required
+  for agent runs. These pages can use their public data feeds without new keys.
+
+#### Daily trading desk
+
+[Daily trading](http://127.0.0.1:8765/#daily) runs on verified regular NSE cash
+sessions while the Market Desk server is running. The scheduler loads the
+[research skill](tradingagents/dashboard/skills/nse-daily-trading/SKILL.md) at
+09:00 IST and uses the configured quick model to brief the exchange watchlist.
+The deep model serves as fallback. The exchange brief and disclosure links
+remain available when either provider has an outage. Scans run every five minutes from 09:21 to 15:31 IST, allowing one minute
+for each completed candle. The desk uses 14:45 as its entry cutoff and 15:00 as
+its simulated time exit. Set `TRADINGAGENTS_DAILY_ENABLED=0` to pause the schedule.
+
+The ₹5,000 starting limit is editable for each IST date. Each idea is a separate
+cash-equity scenario. Its whole-share size fits the capital limit and a 0.65%
+estimated stop-loss budget including costs. The percentage shown is the estimated
+capital loss at the stop. The risk label describes the fractional stop distance.
+Manual **Run replay** compares the three rules on earlier available sessions
+for up to six names from the current watchlist, including estimated costs and
+separate counts for missing exit data.
+
+**Auto trade** runs a forward paper trial for one, three, or five regular
+trading sessions. All three strategies share the daily capital setting. The
+account fixes the amount at the first scan of each session. The scanner adds
+active and rotating NSE cash equities to its search, and keeps scanning stocks
+with open positions. It commits cash only to qualifying setups and carries any
+unused cash through the session. Stop auto trade cancels queued entries and
+keeps managing open positions until their exits.
+
+Paper entries are submitted after confirmation and use the next eligible
+five-minute candle’s opening price inside the entry range. Results include
+modeled charges and slippage. The session history keeps the fills, strategy
+P&L, peak capital, skipped entries, and unresolved positions. The trial runs
+with public candles and advances while the server is up. Positions with missing
+exit prices remain visible for review.
+
+Public candles support the watchlist, research charts and replay. For broker
+quote confirmation, add `UPSTOX_ANALYTICS_TOKEN` to `.env` and restart the server.
+The free read-only token is generated under **Analytics** in Upstox Developer
+Apps and is valid for a year. The standard `UPSTOX_ACCESS_TOKEN` is also accepted.
+Fresh entries require a current five-minute candle, a verified NSE session, and
+broker order-book liquidity at an ask within the proposed range. [Upstox token guide](https://upstox.com/developer/api-documentation/analytics-token/)
+
+For frontend development, run `npm --prefix web run dev` alongside the Python server.
+
+To use Gemini for analysts, the trader, and debate, and Sarvam Token Factory
+for the research and portfolio managers, set this in `.env`:
+
+```dotenv
+GOOGLE_API_KEY=your_google_key
+SARVAM_API_KEY=your_sarvam_key
+SARVAM_MODEL=deepseekv4.1-flash-1017
+OPENAI_COMPATIBLE_API_KEY=${SARVAM_API_KEY}
+TRADINGAGENTS_LLM_PROVIDER=google
+TRADINGAGENTS_QUICK_THINK_LLM=gemini-4-hydrogen
+TRADINGAGENTS_GOOGLE_THINKING_LEVEL=high
+TRADINGAGENTS_DEEP_THINK_PROVIDER=openai_compatible
+TRADINGAGENTS_DEEP_THINK_BACKEND_URL=https://api.sarvam.ai/v2
+TRADINGAGENTS_DEEP_THINK_LLM=${SARVAM_MODEL}
+```
+
+Exchange charts use Yahoo Finance's adjusted daily bars. Indian fund search uses
+AMFI's directory, and fund charts use the MFapi mirror of AMFI NAV history.
+NAV research uses the exact plan and option, recent published NAV, performance,
+and drawdown. Fund factsheets supply holdings, exit loads, benchmarks, and
+other scheme details. AMFI fund jobs are available for research. Scored backtests
+cover exchange-listed instruments and supported crypto series. The backtest
+interface caps each run at 30 ticker/date evaluations.
+
 ### Markets and tickers
 
 TradingAgents works with any market Yahoo Finance covers, using the exchange-suffixed ticker. Company identity and the alpha benchmark resolve automatically per market.

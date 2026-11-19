@@ -6,10 +6,30 @@ CLI and ``TradingAgentsGraph.save_reports`` both call this, so a headless / API
 run produces the same on-disk report tree a CLI run does.
 """
 
+import re
 from datetime import datetime
 from pathlib import Path
 
 from tradingagents.agents.rating import run_rating
+
+_DECISION_HEADING = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]+|[-+*][ \t]+)?(?:\*\*|__)?"
+    r"(executive summary|tl;?dr|investment thesis|price target|time horizon|rating|risk factors|key risks)"
+    r"[ \t]*(?::[ \t]*(?:\*\*|__)?|(?:\*\*|__)[ \t]*:?|(?=$))[ \t]*",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def research_summary(decision: str | None) -> str:
+    """Extract the manager's concise synthesis from structured or prose reports."""
+    if not decision:
+        return ""
+    headings = list(_DECISION_HEADING.finditer(decision))
+    for index, heading in enumerate(headings):
+        if heading[1].casefold() in {"executive summary", "tl;dr", "tldr"}:
+            end = headings[index + 1].start() if index + 1 < len(headings) else len(decision)
+            return decision[heading.end():end].strip()
+    return ""
 
 
 def analyst_names(keys) -> list[str]:
@@ -41,6 +61,8 @@ def _header(ticker: str, final_state: dict, settings: dict | None) -> str:
         vendors = {**(s("data_vendors") or {}), **(s("tool_vendors") or {})}
         if vendors:
             lines.append("- Data vendors: " + ", ".join(f"{k} {v}" for k, v in vendors.items()))
+    if question := final_state.get("research_question"):
+        lines.append("- Research focus: " + " ".join(question.split()))
     if final_state.get("memory_note"):
         lines.append(f"- Memory log: {final_state['memory_note']}")
     return "\n".join(lines) + "\n\n"
@@ -102,7 +124,8 @@ def write_report_tree(final_state: dict, ticker: str, save_path, settings: dict 
     save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
     parts = _report_parts(final_state)
-    sections = []
+    summary = research_summary(final_state.get("final_trade_decision"))
+    sections = [f"## TL;DR\n\n{summary}"] if summary else []
     for heading, folder, written in parts:
         (save_path / folder).mkdir(exist_ok=True)
         for _agent, filename, text in written:

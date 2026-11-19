@@ -72,6 +72,32 @@ class LocalCompatibleChatOpenAI(NormalizedChatOpenAI):
         return super().with_structured_output(schema, method=method, **kwargs)
 
 
+SARVAM_CHAT_BASE_URL = "https://api.sarvam.ai/v2"
+
+
+class SarvamStreamingChatOpenAI(LocalCompatibleChatOpenAI):
+    """Preserve the reasoning field that Sarvam returns in its SSE deltas."""
+
+    def _convert_chunk_to_generation_chunk(self, chunk, default_chunk_class, base_generation_info):
+        generation = super()._convert_chunk_to_generation_chunk(chunk, default_chunk_class, base_generation_info)
+        if generation is None:
+            return generation
+
+        choices = chunk.get("choices") or []
+        delta = (choices[0].get("delta") or {}) if choices else {}
+        reasoning = delta.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning:
+            generation.message.additional_kwargs["sarvam_reasoning"] = reasoning
+
+        # LangChain reads OpenAI's nested completion_tokens_details. Sarvam's
+        # usage stream may also supply the reasoning count at the top level.
+        usage = generation.message.usage_metadata
+        count = (chunk.get("usage") or {}).get("reasoning_tokens")
+        if usage is not None and isinstance(count, int):
+            usage.setdefault("output_token_details", {}).setdefault("reasoning", count)
+        return generation
+
+
 def _input_to_messages(input_: Any) -> list:
     """Normalise a langchain LLM input to a list of message objects.
 
@@ -211,7 +237,7 @@ def _chatgpt_credential() -> Callable[[], str]:
 # Kwargs forwarded from user config to ChatOpenAI
 _PASSTHROUGH_KWARGS = (
     "timeout", "max_retries", "reasoning_effort", "temperature", "max_tokens",
-    "api_key", "callbacks", "http_client", "http_async_client",
+    "api_key", "callbacks", "http_client", "http_async_client", "streaming", "stream_usage",
 )
 
 # OpenAI's ``reasoning_effort`` is only accepted by reasoning models — GPT-5 and
@@ -366,6 +392,8 @@ class OpenAIClient(BaseLLMClient):
                 )
             if base_url:
                 llm_kwargs["base_url"] = base_url
+            if self.provider == "openai_compatible" and (base_url or "").rstrip("/") == SARVAM_CHAT_BASE_URL and self.kwargs.get("streaming"):
+                chat_cls = SarvamStreamingChatOpenAI
 
             # API key: required unless key_optional; keyless local servers get a
             # placeholder. The env-var name is the single source in api_key_env.

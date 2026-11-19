@@ -48,7 +48,7 @@ class TestStockTwitsResilience:
 
 
 @pytest.mark.unit
-class TestStockTwitsCryptoSymbols:
+class TestStockTwitsSymbols:
     @pytest.mark.parametrize(
         ("ticker", "expected"),
         [
@@ -57,6 +57,8 @@ class TestStockTwitsCryptoSymbols:
             ("SOL-USD", "SOL.X"),
             ("BTCUSD", "BTC.X"),      # undashed broker form
             ("BTC-USDT", "BTC.X"),    # stablecoin quote
+            ("reliance.ns", "RELIANCE.NSE"),
+            ("TCS.NSE", "TCS.NSE"),
             ("AMD", "AMD"),
             ("BRK-B", "BRK-B"),       # dashed class share: untouched
             ("GOLD", "GOLD"),         # real equity (aliases elsewhere): untouched here

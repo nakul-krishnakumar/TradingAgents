@@ -61,14 +61,14 @@ def _body(message) -> str:
 
 
 def _stocktwits_symbol(ticker: str) -> str:
-    """Map a crypto pair to StockTwits' ``<BASE>.X`` convention.
-
-    StockTwits lists crypto as ``BTC.X`` (Yahoo's ``BTC-USD`` form 404s), so any
-    crypto symbol resolves to its base plus ``.X``; other symbols pass through
-    upper-cased.
-    """
+    """Convert Yahoo's crypto pairs and NSE listings to Stocktwits cashtags."""
     base = crypto_base(ticker)
-    return f"{base}.X" if base else ticker.strip().upper()
+    if base:
+        return f"{base}.X"
+    symbol = ticker.strip().upper()
+    if symbol.endswith(".NS"):
+        return f"{symbol.removesuffix('.NS')}.NSE"
+    return symbol
 
 
 def fetch_stocktwits_messages(

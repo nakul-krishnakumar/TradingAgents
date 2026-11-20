@@ -1,7 +1,9 @@
 import asyncio
 import json
+import logging
 import secrets
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
@@ -10,6 +12,7 @@ from pydantic import BaseModel
 
 from tradingagents.dashboard.codex_bridge import ChatRequest, CodexExec, create_app
 from tradingagents.dashboard.model_log import ModelLog, read_model_log
+from tradingagents.diagnostics import EventHandler, diagnostic_context, read_events
 from tradingagents.llm_clients.codex_config import (
     DEFAULT_DEEP_MODEL,
     DEFAULT_MODEL,
@@ -135,3 +138,28 @@ def test_codex_provider_usage_and_summary_reach_model_log(bridge, monkeypatch, t
     events = read_model_log(path, 0)["events"]
     assert [event["model"] for event in events if event["type"] == "start"] == [quick, deep]
     assert events[-1]["usage"] == {"input": 100, "output": 12, "thinking": 4}
+
+
+
+def test_bridge_call_can_be_followed_by_original_run_and_model_call_ids(bridge, monkeypatch, tmp_path):
+    backend, http = bridge
+    monkeypatch.setenv(KEY_ENV, backend.key)
+    config = {"llm_provider": "codex", "quick_think_llm": backend.models[0], "stream_model_output": True}
+    client = create_tier_client(config, "quick", http_client=http).get_llm()
+    logger = logging.getLogger("tradingagents.dashboard.codex_bridge")
+    handler = EventHandler("codex-bridge", tmp_path / "events.sqlite3")
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    run = uuid4().hex
+    try:
+        with diagnostic_context(run_id=run):
+            trace = ModelLog(tmp_path / "model_log.jsonl", {})
+            assert client.invoke("Say READY", config={"callbacks": [trace]}).content == "READY"
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+        handler.close()
+    call = read_model_log(trace.path, 0)["events"][0]["call"]
+    events = read_events(handler.path, trace=run)["events"]
+    assert any(entry["event"] == "codex.completed" and entry["fields"]["call_id"] == call for entry in events)

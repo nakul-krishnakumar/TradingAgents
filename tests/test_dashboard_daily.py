@@ -61,6 +61,7 @@ def test_regular_session_schedules_premarket_then_completed_bar_scans(tmp_path, 
     slots = []
 
     def fake_scan(day, now, slot, current):
+        assert desk.view(now=now)["operation"] == "scan"
         slots.append((day, slot))
         desk._save(desk.path(day, "scan.json"), {"slot": slot})
 
@@ -69,6 +70,7 @@ def test_regular_session_schedules_premarket_then_completed_bar_scans(tmp_path, 
         desk.tick(_when(clock))
 
     assert slots == [(DAY, "premarket"), (DAY, "09:21"), (DAY, "09:26"), (DAY, "15:31")]
+    assert desk.view(now=_when("15:49"))["operation"] is None
     assert desk.view(now=_when("15:49"))["next_scan"] == _when("09:00", "2026-11-23").isoformat()
     holiday = _when("10:00", "2026-11-20")
     desk.tick(holiday)
@@ -166,6 +168,31 @@ def test_verified_candles_keep_their_chart_when_prior_volume_history_is_unavaila
     assert all(bar["vwap"] > 0 for bar in chart)
     assert {idea["status"] for idea in ideas} == {"watch"}
     assert all(not idea["live"] for idea in ideas)
+
+
+def test_later_check_keeps_chart_of_traded_stock_after_it_leaves_watchlist(tmp_path, monkeypatch):
+    observed = _when("10:01")
+
+    class FrozenTime(datetime):
+        @classmethod
+        def now(cls, tz):
+            return observed.astimezone(tz)
+
+    monkeypatch.setattr(daily_desk, "datetime", FrozenTime)
+    monkeypatch.setattr(daily_desk.nse, "securities", lambda *_: ())
+    monkeypatch.setattr(daily_desk.nse, "last_bhavcopy", lambda *_: ("", ()))
+    for provider in ("active_equities", "market_status", "disclosures", "corporate_actions"):
+        monkeypatch.setattr(daily_desk.provider, provider, lambda *_: {})
+    monkeypatch.setattr(daily_desk, "_candidates", lambda *_args, **_kwargs: [])
+    desk = daily_desk.DailyDesk({"results_dir": tmp_path})
+    desk.session = _session(DAY)
+    previous = {"bars": [asdict(_candle(5, 100, 101, 99, 100))], "source": "Saved prices"}
+    monkeypatch.setattr(desk.paper, "advance", lambda *_: {"TRADED.NS"})
+    desk._scan(DAY, observed, "10:01", {
+        "brief": {"title": "Saved report"}, "charts": {"TRADED.NS": previous, "OTHER.NS": previous},
+    })
+    assert desk.chart("TRADED.NS", DAY)["bars"] == previous["bars"]
+    assert desk.chart("OTHER.NS", DAY)["bars"] == []
 
 
 def test_exchange_filings_exclude_future_publication_even_for_an_earlier_quarter():

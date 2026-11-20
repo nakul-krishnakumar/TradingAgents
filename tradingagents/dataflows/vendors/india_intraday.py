@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import re
 from datetime import date, datetime, time as wall_time, timedelta
 from functools import lru_cache
-from time import time
-from urllib.parse import quote
+from time import monotonic, time
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
 import requests
@@ -16,6 +17,7 @@ import yfinance as yf
 
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.vendors.yahoo.common import yf_retry
+from tradingagents.diagnostics import elapsed_ms, event, exception_fields
 
 IST = ZoneInfo("Asia/Kolkata")
 _NSE = "https://www.nseindia.in"
@@ -24,13 +26,24 @@ _UPSTOX = "https://api.upstox.com"
 _HEADERS = {"User-Agent": "TradingAgents local research", "Accept": "application/json"}
 _ISIN = re.compile(r"IN[A-Z0-9]{10}")
 _NSE_TICKER = re.compile(r"(?:[A-Z0-9&_-]{1,30}\.NS|\^NSEI|\^NSEBANK)")
+logger = logging.getLogger(__name__)
 
 
 def _get(url: str, *, params=None, token="", timeout=7):
     headers = {**_HEADERS, "Authorization": f"Bearer {token}"} if token else _HEADERS
-    response = requests.get(url, headers=headers, params=params, timeout=timeout)
-    response.raise_for_status()
-    return response.json()
+    host = urlsplit(url).hostname
+    started = monotonic()
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=timeout)
+        response.raise_for_status()
+        result = response.json()
+    except (OSError, ValueError) as exc:
+        event(logger, "market_data.request_failed", "Intraday data request failed", level=logging.WARNING,
+              host=host, elapsed_ms=elapsed_ms(started), **exception_fields(exc))
+        raise
+    event(logger, "market_data.response", "Intraday data source responded",
+          host=host, status=response.status_code, elapsed_ms=elapsed_ms(started))
+    return result
 
 
 def _session(verified: bool, opens: int | None, closes: int | None, source: str, note: str) -> dict:
@@ -252,5 +265,7 @@ def intraday(symbol: str, isin: str, day: str) -> tuple[list[dict], str, str]:
             pass
     try:
         return _yahoo_candles(symbol, selected, selected), "Yahoo Finance", "reference"
-    except (VendorError, ValueError, KeyError):
+    except (VendorError, ValueError, KeyError) as exc:
+        event(logger, "market_data.candles_failed", "Yahoo intraday prices were unavailable",
+              level=logging.WARNING, symbol=symbol, date=day, **exception_fields(exc))
         return [], "Yahoo Finance", "reference"

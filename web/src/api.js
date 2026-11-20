@@ -1,16 +1,38 @@
+import { browserEvent, requestTraceHeaders } from './telemetry';
+
 export async function api(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: options.body ? { 'Content-Type': 'application/json' } : {},
-  });
+  const { background, ...request } = options;
+  const headers = new Headers(request.headers);
+  for (const [name, value] of Object.entries(requestTraceHeaders({ interactive: !background }))) headers.set(name, value);
+  if (request.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+  const track = !path.startsWith('/api/diagnostics');
+  const route = path.split('?')[0].replace(/[a-f0-9]{32}/gi, '{id}');
+  let response;
+  try {
+    response = await fetch(path, { ...request, headers });
+  } catch (err) {
+    if (track && err.name !== 'AbortError') browserEvent('api_error', { control: 'network', detail: `${request.method || 'GET'} ${route}` });
+    throw err;
+  }
+  const requestId = response.headers.get('X-Request-ID');
   if (!response.ok) {
     const result = await response.json().catch(() => ({}));
     const detail = result.detail;
-    throw new Error(typeof detail === 'string' ? detail
+    const message = typeof detail === 'string' ? detail
       : Array.isArray(detail) ? detail.map((item) => item.msg).join('. ')
-        : `Request failed (${response.status})`);
+        : `Request failed (${response.status})`;
+    if (track) browserEvent('api_error', { control: 'api-response', detail: `${request.method || 'GET'} ${route}`, request_id: requestId, status: response.status });
+    const error = new Error(response.status >= 500 && requestId ? `${message} Request ID ${requestId}.` : message);
+    error.requestId = requestId;
+    error.status = response.status;
+    throw error;
   }
-  return response.json();
+  try {
+    return await response.json();
+  } catch (err) {
+    if (track && err.name !== 'AbortError') browserEvent('api_error', { control: 'invalid-json', detail: route, request_id: requestId });
+    throw err;
+  }
 }
 
 export function makeUrl(path, parameters) {
@@ -43,12 +65,16 @@ export function signed(value, suffix = '%') {
   return Number.isFinite(value) ? `${value >= 0 ? '+' : '−'}${number(Math.abs(value))}${suffix}` : '—';
 }
 
+export function signedMoney(value, currency) {
+  return Number.isFinite(value) ? `${value > 0 ? '+' : value < 0 ? '−' : ''}${money(Math.abs(value), currency)}` : '—';
+}
+
 export const tone = (value) => !Number.isFinite(value) || value === 0 ? '' : value > 0 ? 'positive' : 'negative';
-export const typeLabel = { stock: 'Equity', etf: 'ETF', fund: 'Mutual fund', bond: 'Bond', index: 'Index', crypto: 'Crypto', other: 'Instrument' };
+export const typeLabel = { stock: 'Stock', etf: 'ETF', fund: 'Mutual fund', bond: 'Bond', index: 'Index', crypto: 'Crypto', other: 'Asset' };
 export const analysts = {
-  market: { name: 'Market', description: 'Price action and technicals' },
-  news: { name: 'News', description: 'Headlines and macro context' },
-  fundamentals: { name: 'Fundamentals', description: 'Financial statements and valuation' },
-  social: { name: 'Sentiment', description: 'Public discussion and positioning' },
+  market: { name: 'Price and trading', description: 'How the price and trading activity have changed' },
+  news: { name: 'News', description: 'Company news and the wider market' },
+  fundamentals: { name: 'Company finances', description: 'Sales, profits, debt, and what investors are paying' },
+  social: { name: 'Public opinion', description: 'What investors are saying in public discussions' },
 };
 export const openJob = (job) => job.status === 'queued' || job.status === 'running';

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import http.client
+import logging
 import os
 import platform
 import secrets
@@ -13,13 +14,17 @@ import sys
 import tarfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from threading import Thread
 from time import monotonic, sleep
 from urllib.request import urlopen
 
 from dotenv import dotenv_values, set_key
 
+from tradingagents.diagnostics import Redactor, configure_logging, event, exception_fields
+
 _DOWNLOADS = "https://github.com/cloudflare/cloudflared/releases/latest/download"
 _PASSWORD_NAME = "TRADINGAGENTS_TUNNEL_PASSWORD"
+logger = logging.getLogger(__name__)
 
 
 def cloudflared_path():
@@ -36,6 +41,7 @@ def cloudflared_path():
         raise ValueError("Install cloudflared on your PATH for this platform.")
     asset = f"cloudflared-{system}-{arch}" + (".tgz" if system == "darwin" else "")
     print("Downloading cloudflared from Cloudflare's official release…", flush=True)
+    event(logger, "tunnel.download_started", "Downloading Cloudflare tunnel executable", system=system, architecture=arch)
     with TemporaryDirectory(dir=target.parent) as folder:
         downloaded = Path(folder) / asset
         with urlopen(f"{_DOWNLOADS}/{asset}", timeout=45) as response, downloaded.open("wb") as output:
@@ -100,11 +106,22 @@ def terminate(process):
 
 
 def start_dashboard(port, *, env):
-    return subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "tradingagents.dashboard.api:app",
-         "--host", "127.0.0.1", "--port", str(port), "--no-access-log"],
+    process = subprocess.Popen(
+        [sys.executable, "-m", "tradingagents.dashboard.api", str(port)],
         env=env,
     )
+    event(logger, "launcher.dashboard_started", "Market Desk process started", pid=process.pid, port=port)
+    return process
+
+
+def _record_tunnel_output(stream):
+    redact = Redactor()
+    with stream:
+        for line in stream:
+            safe = redact.text(line.strip())
+            if safe:
+                event(logger, "tunnel.output", "Cloudflare tunnel diagnostic", detail=safe)
+                print(safe, flush=True)
 
 
 def main(port):
@@ -112,7 +129,7 @@ def main(port):
     password = tunnel_password()
     env = {**os.environ, "TRADINGAGENTS_QUICK_TUNNEL": "1", _PASSWORD_NAME: password}
     address = f"http://127.0.0.1:{port}"
-    server = tunnel = None
+    server = tunnel = reader = None
 
     def stop(*_):
         raise SystemExit(0)
@@ -121,6 +138,7 @@ def main(port):
     try:
         server = start_dashboard(port, env=env)
         wait_for_auth(server, port)
+        event(logger, "tunnel.authentication_verified", "Market Desk requires sign-in before the tunnel opens", port=port)
         print("Open the HTTPS URL Cloudflare prints. Sign in as marketdesk using the tunnel password in .env.", flush=True)
         # Keep the Quick Tunnel independent of a named tunnel's configuration.
         with TemporaryDirectory() as folder:
@@ -128,19 +146,30 @@ def main(port):
             settings.write_text("{}\n", encoding="utf-8")
             tunnel = subprocess.Popen([
                 cloudflared, "tunnel", "--config", str(settings), "--no-autoupdate", "--url", address,
-            ])
+            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+            event(logger, "tunnel.started", "Cloudflare tunnel process started", pid=tunnel.pid)
+            reader = Thread(target=_record_tunnel_output, args=(tunnel.stdout,), daemon=True)
+            reader.start()
             while server.poll() is None and tunnel.poll() is None:
                 sleep(0.25)
-        return server.returncode if server.returncode is not None else tunnel.returncode
+        status = server.returncode if server.returncode is not None else tunnel.returncode
+        event(logger, "tunnel.process_exited", "A Market Desk tunnel service exited",
+              level=logging.ERROR if status else logging.INFO, dashboard_status=server.returncode, tunnel_status=tunnel.returncode)
+        return status
     except KeyboardInterrupt:
         return 0
     finally:
         terminate(tunnel)
         terminate(server)
+        if reader and reader.is_alive():
+            reader.join(timeout=1)
 
 
 if __name__ == "__main__":
+    configure_logging("launcher")
     try:
         raise SystemExit(main(int(sys.argv[1])))
     except (OSError, tarfile.TarError, ValueError) as error:
-        raise SystemExit(f"Market Desk tunnel could not start. {error}") from None
+        event(logger, "tunnel.failed", "Market Desk tunnel could not start",
+              level=logging.ERROR, **exception_fields(error, stack=True))
+        raise SystemExit("Market Desk tunnel could not start. " + Redactor().text(str(error))) from None

@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from queue import Queue
 from threading import Thread
+from time import monotonic
 from typing import Literal
 from uuid import uuid4
 
@@ -23,6 +24,14 @@ from tradingagents.agents.rating import run_rating
 from tradingagents.backtest import run_backtest, summarize
 from tradingagents.dataflows.config import run_config
 from tradingagents.dataflows.files import replace_file
+from tradingagents.diagnostics import (
+    diagnostic_context,
+    elapsed_ms,
+    event,
+    exception_fields,
+    trace_context,
+    trace_id,
+)
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.llm_clients.api_key_env import get_api_key_env
 from tradingagents.llm_clients.factory import tier_provider
@@ -118,6 +127,8 @@ class JobStore:
         for job in self.list_jobs():
             if job["status"] in ("queued", "running"):
                 self.update(job, status="interrupted", error="The dashboard server restarted during this run.")
+                event(logger, "research.interrupted", "A previous run was interrupted by restart",
+                      level=logging.WARNING, run_id=job["id"], kind=job["type"])
         self.worker = Thread(target=self._work, name="tradingagents-dashboard", daemon=True)
         self.worker.start()
 
@@ -137,17 +148,25 @@ class JobStore:
     def update(self, job: dict, **values):
         job.update(values)
         path = self.directory / job["id"] / "job.json"
-        replace_file(path, lambda temp: Path(temp).write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8"))
+        replace_file(path, lambda temp: Path(temp).write_text(
+            json.dumps(job, ensure_ascii=False), encoding="utf-8",
+        ), strict=True)
 
     def create(self, kind: str, params: dict) -> dict:
         identifier = uuid4().hex
+        context = trace_context()
+        origin = {key: value for key in ("request_id", "session_id", "action_id")
+                  if (value := trace_id(context.get(key)))}
         job = {
             "id": identifier, "type": kind, "status": "queued", "params": params,
             "created": datetime.now(UTC).isoformat(), "providers": provider_status(self.config),
-            "model_log": True,
+            "model_log": True, "origin": origin,
         }
         (self.directory / identifier).mkdir(mode=0o700)
         self.update(job)
+        event(logger, "research.queued", "Research run queued", run_id=identifier, kind=kind,
+              symbol=params.get("symbol"), symbols=params.get("symbols"), date=params.get("date"),
+              analysts=params.get("analysts"), rounds=params.get("rounds"), providers=job["providers"])
         self.queue.put(identifier)
         return job
 
@@ -155,22 +174,36 @@ class JobStore:
         while True:
             identifier = self.queue.get()
             try:
-                job = self.read(identifier)
-                self.update(job, status="running")
-                trace = ModelLog(self.directory / identifier / MODEL_LOG, job["providers"])
-                try:
-                    if job["type"] == "research":
-                        self._research(job, trace)
-                    else:
-                        self._backtest(job, trace)
-                    self.update(job, status="completed")
-                except Exception as exc:
-                    # Provider exceptions can embed credentials or request data.
-                    logger.error("Dashboard job %s failed (%s, HTTP %s)", identifier,
-                                 type(exc).__name__, getattr(exc, "status_code", None))
-                    self.update(job, status="failed", error=_error_label(exc))
+                with diagnostic_context(run_id=identifier):
+                    job = self.read(identifier)
+                    with diagnostic_context(**job.get("origin", {})):
+                        self._run_job(job)
+            except Exception as exc:
+                event(logger, "research.worker_error", "The worker could not load or save a run",
+                      level=logging.ERROR, run_id=identifier, **exception_fields(exc, stack=True))
             finally:
                 self.queue.task_done()
+
+    def _run_job(self, job):
+        started = monotonic()
+        trace = ModelLog(self.directory / job["id"] / MODEL_LOG, job["providers"])
+        event(logger, "research.started", "Research worker started the run", kind=job["type"])
+        try:
+            self.update(job, status="running")
+            if job["type"] == "research":
+                self._research(job, trace)
+            else:
+                self._backtest(job, trace)
+            self.update(job, status="completed")
+            event(logger, "research.completed", "Research run completed", kind=job["type"],
+                  elapsed_ms=elapsed_ms(started), rating=job.get("rating"), report=job.get("report"),
+                  failed_cells=job.get("failed_cells"), settlement_failures=job.get("settlement_failures"))
+        except Exception as exc:
+            event(logger, "research.failed", "Research run failed", level=logging.ERROR, kind=job["type"],
+                  elapsed_ms=elapsed_ms(started), **exception_fields(exc, stack=True))
+            self.update(job, status="failed", error=_error_label(exc))
+        finally:
+            trace.flush()
 
     def _research(self, job: dict, trace: ModelLog):
         params = job["params"]
@@ -198,6 +231,9 @@ class JobStore:
         args = graph.propagator.get_graph_args()
 
         with run_config(config), graph.checkpoint_scope(symbol, trade_date, asset_type, portfolio) as thread_id:
+            event(logger, "research.graph_started", "Research graph initialized", symbol=symbol, date=trade_date,
+                  asset_type=asset_type, checkpoint=bool(thread_id), question_length=len(params["question"]),
+                  portfolio_context=portfolio is not None)
             if is_amfi:
                 state = self._fund_state(graph, symbol, trade_date, portfolio, config)
             else:
@@ -221,6 +257,7 @@ class JobStore:
 
         final["research_question"] = params["question"]
         graph.save_reports(final, symbol, self.directory / job["id"] / "report")
+        event(logger, "research.report_saved", "Research report saved", symbol=symbol, date=trade_date)
         if not is_amfi:
             graph.record_decision(symbol, trade_date, final)
         graph.clear_checkpoint_on_success(symbol, trade_date, asset_type, portfolio)
@@ -281,7 +318,12 @@ class JobStore:
                     status = "running" if key in ANALYSTS or active.get(key) else "pending"
                 steps.append({**step, "status": status})
             if updated or steps != job["steps"]:
+                transitions = [{**step, "previous": prior["status"]} for prior, step in zip(job["steps"], steps, strict=True)
+                               if prior["status"] != step["status"]]
                 self.update(job, steps=steps, tools=dict(tool_calls))
+                for transition in transitions:
+                    event(logger, "research.stage", "Research stage changed", stage=transition["id"],
+                          name=transition["name"], status=transition["status"], previous=transition["previous"])
         return final
 
     def _backtest(self, job: dict, trace: ModelLog):
@@ -290,11 +332,18 @@ class JobStore:
         def progress(done, total, ticker, day):
             trace.select_cell(ticker, day)
             self.update(job, progress={"cell": done, "total": total, "symbol": ticker, "date": day})
+            event(logger, "backtest.cell_started", "Historical decision test started", cell=done, total=total, symbol=ticker, date=day)
 
         result = run_backtest(
             p["symbols"], p["dates"], {**self.config, "stream_model_output": True},
             selected_analysts=p["analysts"], callbacks=[trace],
             asset_type=detect_asset_type(p["symbols"][0]).value, progress=progress, run_id=job["id"],
         )
+        for ticker, day, reason in result.failures:
+            event(logger, "backtest.cell_failed", "Historical decision test failed",
+                  level=logging.WARNING, symbol=ticker, date=day, error=reason)
+        for ticker, reason in result.settlement_failures:
+            event(logger, "backtest.settlement_failed", "Historical price comparison failed",
+                  level=logging.WARNING, symbol=ticker, error=reason)
         self.update(job, summary=asdict(summarize(result)), cells_run=result.cells_run,
                     failed_cells=len(result.failures), settlement_failures=len(result.settlement_failures))

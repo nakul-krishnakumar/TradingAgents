@@ -276,7 +276,7 @@ The free Quick Tunnel address is temporary and changes on restart. Keep the
 server and tunnel running while you need the address. [Cloudflare Quick Tunnels](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
 
 Open [Market Desk](http://127.0.0.1:8765) and search by Yahoo ticker, fund name, or
-AMFI scheme code. In **Research runs**, open a run's **Model log** for live chat
+AMFI scheme code. In **Research history**, open a run's **AI output and logs** for live chat
 output, provider-supplied reasoning or thought summaries, tool calls, and token
 usage. Counts become available when the provider reports usage. The JSONL
 download is also saved in the run directory as `model_log.jsonl`. Completed
@@ -305,6 +305,32 @@ reports start with a TL;DR of the main findings, counterpoint, and decision.
   and corporate disclosures. Local votes and available samples of Stocktwits
   labels have their own counts and coverage. Research model keys are required
   for agent runs. These pages can use their public data feeds without new keys.
+
+#### Debugging Market Desk
+
+Open **Logs** to search system events or filter to warnings and errors. Each
+entry shows its time, source, and details. Follow a request, browser action,
+market check, research run, or model call by clicking its ID. Research reports
+have a **Run logs** button and each saved Auto Trade check has **Check logs**.
+The download exports up to 5,000 entries that match the current filters.
+
+The launcher prints the path to the persistent event journal. By default it is
+`~/.tradingagents/logs/dashboard/diagnostics/events.sqlite3`, or
+`<TRADINGAGENTS_RESULTS_DIR>/dashboard/diagnostics/events.sqlite3` if configured.
+The API, launcher, and Codex bridge write to the same journal. It keeps roughly
+250,000 events, with a separate share of space reserved for warnings and
+errors. Set `TRADINGAGENTS_LOG_DIR` to move the journal or
+`TRADINGAGENTS_LOG_MAX_EVENTS` to change the limit. If the journal is
+temporarily unwritable, the server prints the redacted event to stderr.
+
+Per-run `model_log.jsonl` files hold model responses, tool activity, token
+counts, and the reasoning summaries or text supplied by the provider. Short
+stream fragments can appear with a slight delay so credentials split across
+fragments can be redacted. The logging system records browser actions, form
+submissions, and errors without copying typed field values, credentials, full
+API bodies, or model prompts into the system journal. Newly written logs
+redact recognized secrets. Treat older log files and all research output as
+private when sharing diagnostics.
 
 #### Use Codex for both model tiers
 

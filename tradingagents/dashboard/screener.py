@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime
@@ -27,10 +28,12 @@ from tradingagents.dataflows.vendors.amfi import (
 )
 from tradingagents.dataflows.vendors.yahoo.fundamentals import get_company_profile
 from tradingagents.dataflows.vendors.yahoo.screening import net_income_matches
+from tradingagents.diagnostics import event, exception_fields, submit_traced
 
 from .market import DEFAULTS, chart_data, instrument
 from .workspace_store import Asset
 
+logger = logging.getLogger(__name__)
 ScreenKind = Literal["all", "stock", "etf", "fund", "bond", "other"]
 _EXCHANGE_KINDS = ("stock", "etf", "bond", "reit", "invit")
 _PROFILE_URL = "https://finance.yahoo.com/quote/"
@@ -377,23 +380,25 @@ def snapshot(day: str, bucket: int, scope: str) -> dict:
     groups = _EXCHANGE_KINDS if scope == "all" else ("reit", "invit") if scope == "other" else (scope,) if scope != "fund" else ()
     rows, unavailable = [], []
     with ThreadPoolExecutor(max_workers=10) as pool:
-        pending = {group: pool.submit(nse.securities, group, day) for group in groups}
+        pending = {group: submit_traced(pool, nse.securities, group, day) for group in groups}
         if "stock" in groups:
-            pending["sectors"] = pool.submit(nse.industries, day)
+            pending["sectors"] = submit_traced(pool, nse.industries, day)
         if groups:
-            pending["quotes"] = pool.submit(nse.sample_bhavcopies, dates)
+            pending["quotes"] = submit_traced(pool, nse.sample_bhavcopies, dates)
         if "etf" in groups:
-            pending["ETF statistics"] = pool.submit(nse.market_etfs, bucket)
+            pending["ETF statistics"] = submit_traced(pool, nse.market_etfs, bucket)
         if "bond" in groups:
-            pending["NSDL debt terms"] = pool.submit(nsdl.debt_terms, day)
+            pending["NSDL debt terms"] = submit_traced(pool, nsdl.debt_terms, day)
         if include_funds:
-            pending["AMFI"] = pool.submit(fund_directory, day, bucket)
+            pending["AMFI"] = submit_traced(pool, fund_directory, day, bucket)
         values = {}
         for source, future in pending.items():
             try:
                 values[source] = future.result()
             except (OSError, ValueError, KeyError) as exc:
                 unavailable.append(f"{source} ({type(exc).__name__})")
+                event(logger, "screener.source_failed", "Screener reference data was unavailable",
+                      level=logging.WARNING, source=source, date=day, **exception_fields(exc))
 
     for group in groups:
         rows.extend(_nse_assets(group, day, values.get(group, ())))
@@ -417,24 +422,28 @@ def snapshot(day: str, bucket: int, scope: str) -> dict:
     with ThreadPoolExecutor(max_workers=10) as pool:
         requests = {}
         if session and set(groups).intersection({"stock", "etf"}):
-            requests.update({name: (reports, pool.submit(nse.equity_report, name, session))
+            requests.update({name: (reports, submit_traced(pool, nse.equity_report, name, session))
                              for name in ("valuation", "delivery", "range")})
         if fund_session:
             start = pd.Timestamp(fund_session)
-            requests.update({key: (historical_navs, pool.submit(
+            requests.update({key: (historical_navs, submit_traced(pool,
                 latest_previous_navs, (start - pd.DateOffset(months=months)).date().isoformat(),
             )) for key, months in _PERIODS.items()})
-            expense_request = pool.submit(expense_ratios, day)
+            expense_request = submit_traced(pool, expense_ratios, day)
         for name, (destination, future) in requests.items():
             try:
                 destination[name] = future.result()
             except (OSError, ValueError, KeyError) as exc:
                 unavailable.append(f"{name} ({type(exc).__name__})")
+                event(logger, "screener.source_failed", "Historical screener data was unavailable",
+                      level=logging.WARNING, source=name, date=day, **exception_fields(exc))
         if fund_session:
             try:
                 ter = expense_request.result()
             except (OSError, ValueError, KeyError, ImportError) as exc:
                 unavailable.append(f"AMFI TER ({type(exc).__name__})")
+                event(logger, "screener.source_failed", "Mutual fund expense data was unavailable",
+                      level=logging.WARNING, source="AMFI TER", date=day, **exception_fields(exc))
     _apply_exchange_reports(rows, reports)
     if fund_session:
         _apply_fund_data(rows, fund_session, historical_navs, ter)
@@ -505,8 +514,10 @@ def _enrich_one(asset, day, config):
     if kind != "fund" or not symbol.startswith("AMFI-"):
         try:
             info = get_company_profile(symbol)
-        except (OSError, ValueError, RuntimeError):
+        except (OSError, ValueError, RuntimeError) as exc:
             info = {}
+            event(logger, "screener.profile_failed", "Investment profile was unavailable",
+                  level=logging.WARNING, symbol=symbol, **exception_fields(exc))
         if info:
             item.update(sector=info.get("sector"), industry=info.get("industry"),
                         issuer=info.get("fundFamily"), category=info.get("category"))
@@ -535,8 +546,9 @@ def _enrich_one(asset, day, config):
             item["metrics"].update({key: value for key, value in _history_metrics(chart).items()
                                     if key not in _CURRENCY_FIELDS})
         item["sources"].append(chart["source"] + " history")
-    except (OSError, ValueError, RuntimeError):
-        pass
+    except (OSError, ValueError, RuntimeError) as exc:
+        event(logger, "screener.history_failed", "Investment price history was unavailable",
+              level=logging.WARNING, symbol=symbol, **exception_fields(exc))
     folder = _profile_directory(config)
     folder.mkdir(parents=True, exist_ok=True)
     replace_file(folder / f"{symbol}.json", lambda filename: Path(filename).write_text(
@@ -549,7 +561,7 @@ def enrich(request: EnrichRequest, day: str, config: dict):
     assets = {asset.symbol: asset.stored() for asset in request.assets}
     loaded, unavailable = [], []
     with ThreadPoolExecutor(max_workers=5) as pool:
-        pending = {symbol: pool.submit(_enrich_one, asset, day, config) for symbol, asset in assets.items()}
+        pending = {symbol: submit_traced(pool, _enrich_one, asset, day, config) for symbol, asset in assets.items()}
         for symbol, action in pending.items():
             try:
                 result = action.result()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
@@ -16,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from tradingagents.dataflows.config import run_config
 from tradingagents.dataflows.date_window import get_current_date
 from tradingagents.dataflows.vendors.stocktwits import fetch_stocktwits_messages
+from tradingagents.diagnostics import event, exception_fields, submit_traced
 
 from .market import chart_data, resolve_symbol
 from .screener import EnrichRequest, ScreenRequest, describe_axes, enrich, latest_snapshot, screen
@@ -41,6 +43,7 @@ POPULAR = (
     {"name": "CWA Smallcap Fund Picks", "theme": "Mutual funds", "url": "https://www.smallcase.com/smallcase/MF_COWAQM_0001"},
 )
 _STANCES = re.compile(r"^Bullish: (\d+) .*?Bearish: (\d+) .*?Unlabeled: (\d+) .*?Total: (\d+)", re.MULTILINE)
+logger = logging.getLogger(__name__)
 
 
 class WishlistChange(BaseModel):
@@ -72,7 +75,7 @@ def sample_discussion(request: DiscussionRequest, day: str):
               if asset.stored()["kind"] in {"stock", "etf", "crypto"}}
     samples = []
     with ThreadPoolExecutor(max_workers=3) as pool:
-        pending = {symbol: pool.submit(
+        pending = {symbol: submit_traced(pool,
             fetch_stocktwits_messages, symbol, 25, 6, start, day,
         ) for symbol in assets}
         for symbol, action in pending.items():
@@ -119,22 +122,27 @@ def quote_for(asset: dict, day: str, config: dict):
             if chart.get("currency") == "INR" and (date.fromisoformat(day) - date.fromisoformat(latest["time"])).days <= 10:
                 return {"price": round(latest["close"], 6), "date": latest["time"], "currency": "INR",
                         "source": chart["source"] + " · " + chart["pricing"], "lot": 1}
-        except (OSError, ValueError, RuntimeError):
-            pass
+        except (OSError, ValueError, RuntimeError) as exc:
+            event(logger, "data.paper_quote_failed", "Could not retrieve a reference price",
+                  level=logging.WARNING, symbol=symbol, date=day, **exception_fields(exc))
     raise ValueError(f"A recent INR quote is unavailable for {symbol}. Enter a manual INR price for a paper fill.")
 
 
 def _quotes(assets, day, config):
     results, unavailable = {}, {}
     with ThreadPoolExecutor(max_workers=5) as pool:
-        pending = {asset["symbol"]: pool.submit(quote_for, asset, day, config) for asset in assets}
+        pending = {asset["symbol"]: submit_traced(pool, quote_for, asset, day, config) for asset in assets}
         for symbol, action in pending.items():
             try:
                 results[symbol] = action.result()
             except ValueError as exc:
                 unavailable[symbol] = str(exc)
-            except (OSError, RuntimeError):
+                event(logger, "data.paper_quote_unavailable", "A basket price was unavailable",
+                      level=logging.WARNING, symbol=symbol, **exception_fields(exc))
+            except (OSError, RuntimeError) as exc:
                 unavailable[symbol] = "This quote source is temporarily unavailable."
+                event(logger, "data.paper_quote_failed", "A basket price could not be fetched",
+                      level=logging.WARNING, symbol=symbol, **exception_fields(exc))
     return results, unavailable
 
 
@@ -148,7 +156,10 @@ def workspace_router(config: dict):
 
     @router.post("/screener")
     def run_screen(request: ScreenRequest):
-        return _checked(screen, request, get_current_date(), config)
+        result = _checked(screen, request, get_current_date(), config)
+        event(logger, "screener.completed", "Investment filters applied", investment_type=request.kind, sort=request.sort,
+              filters=[item.key for item in request.filters], matches=result["total"], unavailable=result["unavailable"])
+        return result
 
     @router.post("/screener/enrich")
     def enrich_screen(request: EnrichRequest):
@@ -160,15 +171,21 @@ def workspace_router(config: dict):
 
     @router.post("/wishlists", status_code=201)
     def create_wishlist(request: Named):
-        return _checked(store.create, "wishlist", request.name, {"assets": []})
+        item = _checked(store.create, "wishlist", request.name, {"assets": []})
+        event(logger, "wishlist.created", "Saved list created", wishlist_id=item["id"])
+        return item
 
     @router.post("/wishlists/{identifier}/assets")
     def wishlist_asset(identifier: str, request: WishlistChange):
-        return _checked(store.set_wishlist, identifier, request.asset, request.included)
+        item = _checked(store.set_wishlist, identifier, request.asset, request.included)
+        event(logger, "wishlist.changed", "Saved list membership changed", wishlist_id=identifier,
+              symbol=request.asset.symbol, included=request.included)
+        return item
 
     @router.delete("/wishlists/{identifier}")
     def delete_wishlist(identifier: str):
         _checked(store.remove, "wishlist", identifier)
+        event(logger, "wishlist.deleted", "Saved list deleted", wishlist_id=identifier)
         return {"deleted": True}
 
     @router.get("/baskets/popular")
@@ -189,6 +206,7 @@ def workspace_router(config: dict):
         item = _checked(store.create, "basket", request.name, {
             "capital": str(request.capital), "targets": targets, "orders": [],
         })
+        event(logger, "basket.created", "Practice portfolio created", basket_id=item["id"], funds=str(request.capital))
         return store.basket(item["id"])
 
     @router.get("/baskets/{identifier}")
@@ -199,6 +217,8 @@ def workspace_router(config: dict):
     def update_targets(identifier: str, request: BasketTargets):
         targets = _checked(validate_targets, request.targets)
         _checked(store.update, "basket", identifier, lambda item: item.update(targets=targets))
+        event(logger, "basket.targets_saved", "Practice portfolio weights saved", basket_id=identifier,
+              targets=len(targets))
         return store.basket(identifier)
 
     @router.post("/paper/quote")
@@ -222,7 +242,11 @@ def workspace_router(config: dict):
         if price is None:
             quote = _checked(quote_for, request.asset.stored(), get_current_date(), config)
             source, session, price = quote["source"], quote["date"], Decimal(str(quote["price"]))
-        return _checked(store.fill, identifier, request, price, source, session)
+        updated = _checked(store.fill, identifier, request, price, source, session)
+        event(logger, "basket.order_saved", "Practice portfolio order saved", basket_id=identifier,
+              order_id=request.request_id, side=request.side, symbol=request.asset.symbol, quantity=str(request.units),
+              price=str(price), fee=str(request.fee), source=source)
+        return updated
 
     @router.post("/baskets/{identifier}/allocate")
     def fund_basket(identifier: str, request: FundingOrder):
@@ -252,7 +276,10 @@ def workspace_router(config: dict):
             fills.append((order, price, quote["source"], quote["date"]))
         if sum((cash_value(order.units * price) + order.fee for order, price, *_ in fills), ZERO) > request.budget:
             raise HTTPException(400, "Rounded fill values exceed this budget. Increase the budget or reduce fees.")
-        return _checked(store.fill_batch, identifier, fills)
+        updated = _checked(store.fill_batch, identifier, fills)
+        event(logger, "basket.allocation_saved", "Practice portfolio purchases saved", basket_id=identifier,
+              order_id=request.request_id, orders=len(fills), budget=str(request.budget))
+        return updated
 
     @router.get("/market/trends")
     def markets():
@@ -262,7 +289,9 @@ def workspace_router(config: dict):
     def current_fund_movers():
         try:
             return {**fund_movers(get_current_date(), int(time() // 900)), "flows_source": AMFI_FLOWS}
-        except (OSError, ValueError, KeyError):
+        except (OSError, ValueError, KeyError) as exc:
+            event(logger, "data.fund_movers_failed", "Mutual fund price comparisons were unavailable",
+                  level=logging.WARNING, **exception_fields(exc))
             return {"rows": [], "matched": 0, "session": "", "unavailable": True, "flows_source": AMFI_FLOWS}
 
     @router.post("/market/discussion")
@@ -279,6 +308,7 @@ def workspace_router(config: dict):
         symbol = "MARKET" if request.symbol.upper() == "MARKET" else _checked(resolve_symbol, request.symbol)
         day = get_current_date()
         store.vote(symbol, request.voter, request.stance, day)
+        event(logger, "market.vote_saved", "Market opinion saved", symbol=symbol, stance=request.stance)
         return {"day": day, "votes": store.votes(day)}
 
     return router

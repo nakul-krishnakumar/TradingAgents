@@ -1,4 +1,5 @@
 import logging
+from time import monotonic
 
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.errors import (
@@ -38,6 +39,7 @@ from tradingagents.dataflows.vendors.yahoo.market import (
     get_YFin_data_online,
 )
 from tradingagents.dataflows.vendors.yahoo.news import get_global_news_yfinance, get_news_yfinance
+from tradingagents.diagnostics import Redactor, elapsed_ms, event, exception_fields
 
 logger = logging.getLogger(__name__)
 
@@ -231,28 +233,39 @@ def route_to_vendor(method: str, *args, **kwargs):
     for vendor in vendor_chain:
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
+        started = monotonic()
 
         try:
-            return impl_func(*args, **kwargs)
+            result = impl_func(*args, **kwargs)
+            event(logger, "data.vendor_completed", "Data provider finished a tool request",
+                  vendor=vendor, tool=method, category=category, elapsed_ms=elapsed_ms(started))
+            return result
         except VendorUnavailableError as e:
-            logger.warning("Vendor %r unavailable for %s: %s; trying next vendor.", vendor, method, e)
+            event(logger, "data.vendor_unavailable", "Data provider unavailable, trying the configured fallback",
+                  level=logging.WARNING, vendor=vendor, tool=method, elapsed_ms=elapsed_ms(started), **exception_fields(e))
             # Kept so an all-unavailable chain can say the vendor was the
             # problem, rather than reporting nothing about the symbol.
             last_unavailable = e
             continue
         except VendorNotConfiguredError as e:
-            logger.warning("Vendor %r not configured for %s; trying next vendor.", vendor, method)
+            event(logger, "data.vendor_unconfigured", "Data provider needs configuration",
+                  level=logging.WARNING, vendor=vendor, tool=method, **exception_fields(e))
             if first_error is None:
                 first_error = e  # Surface it if no other vendor can serve the call.
             continue
         except NoMarketDataError as e:
+            event(logger, "data.vendor_no_data", "Data provider reported no market data",
+                  vendor=vendor, tool=method, elapsed_ms=elapsed_ms(started), **exception_fields(e))
             last_no_data = e  # No data here; another configured vendor may have it
             continue
         except Exception as e:
             # Don't let one vendor's failure crash the call when another can
             # serve it, but never swallow silently: a broken primary must be
             # visible in the logs (#989), not hidden behind a fallback's verdict.
-            logger.warning("Vendor %r failed for %s: %s", vendor, method, e)
+            detail = Redactor().text(str(e))
+            event(logger, "data.vendor_failed", f"Vendor {vendor!r} failed for {method}: {detail}",
+                  level=logging.WARNING, vendor=vendor, tool=method, elapsed_ms=elapsed_ms(started),
+                  **exception_fields(e, stack=True))
             if first_error is None:
                 first_error = e
             failed = e

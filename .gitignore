@@ -229,6 +229,8 @@ __marimo__/
 reports/
 /.tradingagents/
 /logs/
+events.sqlite3*
+model_log.jsonl
 
 # Local dashboard build artifacts
 /web/node_modules/

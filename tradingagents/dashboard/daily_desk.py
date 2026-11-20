@@ -12,12 +12,21 @@ from pathlib import Path
 from threading import Event, Lock, Thread
 from time import monotonic
 from urllib.parse import urlsplit
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
 from tradingagents.dataflows.errors import VendorError
 from tradingagents.dataflows.files import replace_file
 from tradingagents.dataflows.vendors import india_intraday as provider, nse
+from tradingagents.diagnostics import (
+    diagnostic_context,
+    elapsed_ms,
+    event,
+    exception_fields,
+    submit_traced,
+    trace_context,
+)
 
 from .daily_paper import DailyPaper
 from .daily_strategy import (
@@ -113,9 +122,12 @@ def _stamp(raw):
 
 def _load(future, fallback, source, warnings):
     try:
-        return future.result()
+        value = future.result()
+        event(logger, "daily.source_completed", "Daily scan data source completed", source=source)
+        return value
     except Exception as exc:
-        logger.info("Daily desk source %s unavailable (%s)", source, type(exc).__name__)
+        event(logger, "daily.source_failed", "Daily scan data source failed", level=logging.WARNING,
+              source=source, **exception_fields(exc))
         warnings.append(f"{source} was unavailable for this scan.")
         return fallback
 
@@ -207,7 +219,9 @@ def _scan_asset(asset, day, now, open_for_signals, budget):
     today = _day_bars(returned, day, int(now.timestamp()))
     try:
         prior_data = provider.history(asset["symbol"], day)
-    except (OSError, RuntimeError, ValueError, VendorError):
+    except (OSError, RuntimeError, ValueError, VendorError) as exc:
+        event(logger, "daily.price_history_failed", "Earlier prices were unavailable for strategy comparison",
+              level=logging.WARNING, symbol=asset["symbol"], date=day, **exception_fields(exc))
         prior_data = []
     as_of = today[-1].time + BAR_SECONDS if today else None
     late = int(now.timestamp()) - as_of if as_of is not None else None
@@ -252,7 +266,11 @@ class DailyDesk:
         self.wake, self.closed = Event(), Event()
         self.guard = Lock()
         self.request = None
+        self.request_origin = {}
         self.running = False
+        self.operation = None
+        self.scan_id = None
+        self.failed_scan_id = None
         self.status = ""
         self.cooldown = 0.0
         self.session = _EMPTY
@@ -265,10 +283,12 @@ class DailyDesk:
         self.root.mkdir(parents=True, exist_ok=True)
         self.thread = Thread(target=self._loop, daemon=True, name="tradingagents-daily-desk")
         self.thread.start()
+        event(logger, "daily.scheduler_started", "Daily desk worker started", automatic_checks=self.enabled, timezone="Asia/Kolkata")
 
     def stop(self):
         self.closed.set()
         self.wake.set()
+        event(logger, "daily.scheduler_stopping", "Daily desk worker asked to stop")
 
     def path(self, day, file):
         return self.root / day / file
@@ -277,20 +297,26 @@ class DailyDesk:
     def _read(path, fallback):
         try:
             return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            return fallback
+        except (OSError, ValueError) as exc:
+            event(logger, "daily.snapshot_read_failed", "Could not read a saved daily desk record",
+                  level=logging.WARNING, file=path.name, date=path.parent.name, **exception_fields(exc))
             return fallback
 
     def _save(self, path, record):
         path.parent.mkdir(parents=True, exist_ok=True)
         replace_file(path, lambda target: Path(target).write_text(
             json.dumps(record, ensure_ascii=False, allow_nan=False), encoding="utf-8",
-        ))
+        ), strict=True)
 
     def budget(self, day):
         return self._read(self.path(day, "budget.json"), {}).get("budget", 5000)
 
     def set_budget(self, amount):
-        self._save(self.path(datetime.now(IST).date().isoformat(), "budget.json"), {"budget": round(amount, 2)})
+        day = datetime.now(IST).date().isoformat()
+        self._save(self.path(day, "budget.json"), {"budget": round(amount, 2)})
+        event(logger, "daily.budget_changed", "Daily paper money limit changed", date=day, budget=round(amount, 2))
         return self.view()
 
     def set_auto_trade(self, settings, now=None):
@@ -304,9 +330,12 @@ class DailyDesk:
     def enqueue(self, operation):
         with self.guard:
             if self.running or self.request is not None or monotonic() < self.cooldown:
+                event(logger, "daily.request_busy", "The daily desk could not accept another request yet", operation=operation)
                 return False
             self.request = operation
+            self.request_origin = trace_context()
             self.wake.set()
+        event(logger, "daily.request_queued", "Daily desk request queued", operation=operation)
         return True
 
     def _calendar(self, now):
@@ -317,8 +346,12 @@ class DailyDesk:
         try:
             session = provider.session_for(day)
         except Exception as exc:
-            logger.info("Daily calendar check failed (%s)", type(exc).__name__)
+            event(logger, "daily.calendar_failed", "Could not verify the NSE trading calendar",
+                  level=logging.WARNING, date=day, **exception_fields(exc))
             session = _EMPTY
+        if self.session_day != day or self.session != session:
+            event(logger, "daily.calendar_checked", "NSE trading calendar checked", date=day,
+                  verified=session["verified"], opens=session["opens"], closes=session["closes"])
         self.session_day, self.session, self.checked_calendar = day, session, monotonic()
         if session.get("verified") and session.get("opens") and not slot_times(session):
             self.session = {**session, "note": "Special session hours are outside the regular-session strategy."}
@@ -332,7 +365,9 @@ class DailyDesk:
         for shift in range(1, 8):
             try:
                 following = provider.session_for((now.date() + timedelta(days=shift)).isoformat())
-            except Exception:
+            except Exception as exc:
+                event(logger, "daily.calendar_lookahead_failed", "Could not verify a future NSE trading day",
+                      level=logging.WARNING, days_ahead=shift, **exception_fields(exc))
                 continue
             if slots := slot_times(following):
                 self.next_open = slots[0][1]
@@ -344,7 +379,8 @@ class DailyDesk:
             try:
                 self.tick()
             except Exception as exc:
-                logger.warning("Daily desk tick did not finish (%s)", type(exc).__name__)
+                event(logger, "daily.scheduler_error", "The daily desk worker did not finish a check",
+                      level=logging.ERROR, **exception_fields(exc, stack=True))
                 self.status = f"The last scan could not finish ({type(exc).__name__})."
             self.wake.wait(15)
 
@@ -365,49 +401,72 @@ class DailyDesk:
             scheduled = slots[-1][0]
         with self.guard:
             requested, self.request = self.request, None
+            origin, self.request_origin = self.request_origin, {}
             if not requested and not scheduled:
                 return
             self.running = True
-        try:
-            self.status = ""
-            if requested == "replay":
-                from .daily_research import replay_summary
+            self.operation = requested or "scan"
+            self.scan_id = uuid4().hex
+            self.failed_scan_id = None
+        with diagnostic_context(**{**origin, "scan_id": self.scan_id, "date": day, "operation": self.operation}):
+            started = monotonic()
+            slot = due[-1][0] if due else "manual"
+            try:
+                self.status = ""
+                event(logger, "daily.started", "Daily desk operation started", slot=slot, trigger="manual" if requested else "scheduled")
+                if requested == "replay":
+                    from .daily_research import replay_summary
 
-                self._save(self.path(day, "replay.json"), replay_summary(current.get("candidates", []), day, self.budget(day)))
-            elif requested == "scan" or scheduled:
-                self._scan(day, now, due[-1][0] if due else "manual", current)
-        finally:
-            with self.guard:
-                self.running = False
-                self.cooldown = monotonic() + 8
+                    replay = replay_summary(current.get("candidates", []), day, self.budget(day))
+                    self._save(self.path(day, "replay.json"), replay)
+                    event(logger, "daily.replay_saved", "Historical strategy test saved", sessions=replay["sessions"],
+                          symbols=replay["symbols"], strategies=replay["strategies"])
+                elif requested == "scan" or scheduled:
+                    self._scan(day, now, slot, current)
+                event(logger, "daily.completed", "Daily desk operation completed", slot=slot,
+                      elapsed_ms=elapsed_ms(started), note=self.status or None)
+            except Exception as exc:
+                self.failed_scan_id = self.scan_id
+                event(logger, "daily.failed", "Daily desk operation failed", level=logging.ERROR,
+                      slot=slot, elapsed_ms=elapsed_ms(started), **exception_fields(exc, stack=True))
+                raise
+            finally:
+                with self.guard:
+                    self.running = False
+                    self.operation = None
+                    self.scan_id = None
+                    self.cooldown = monotonic() + 8
 
     def _scan(self, day, now, slot, current):
         phase = phase_for(now, self.session)
         before_open = phase == "premarket"
         if not slot_times(self.session):
             self.status = "Waiting for a verified regular NSE cash session."
+            event(logger, "daily.scan_waiting", "The market check needs a verified NSE trading session")
             return
         warnings = []
         try:
             skill = SKILL.read_text(encoding="utf-8")
-        except OSError:
+        except OSError as exc:
             skill = ""
             warnings.append("The daily strategy skill could not be read.")
+            event(logger, "daily.skill_read_failed", "Daily strategy skill could not be read",
+                  level=logging.WARNING, **exception_fields(exc))
         bucket = int(now.timestamp() // BAR_SECONDS)
         prior_day = (now.date() - timedelta(days=1)).isoformat()
         with ThreadPoolExecutor(max_workers=5) as pool:
             pending = {
-                "NSE security master": (pool.submit(nse.securities, "stock", day), ()),
-                "Prior NSE session": (pool.submit(nse.last_bhavcopy, prior_day), ("", ())),
+                "NSE security master": (submit_traced(pool, nse.securities, "stock", day), ()),
+                "Prior NSE session": (submit_traced(pool, nse.last_bhavcopy, prior_day), ("", ())),
             }
             if before_open:
-                pending["NSE pre-open auction"] = (pool.submit(provider.preopen_equities, bucket), {})
+                pending["NSE pre-open auction"] = (submit_traced(pool, provider.preopen_equities, bucket), {})
             else:
-                pending["NSE activity"] = (pool.submit(provider.active_equities, bucket), {})
+                pending["NSE activity"] = (submit_traced(pool, provider.active_equities, bucket), {})
             if phase == "open":
-                pending["NSE market status"] = (pool.submit(provider.market_status, bucket), {})
-            pending["NSE disclosures"] = (pool.submit(provider.disclosures, day), [])
-            pending["NSE corporate actions"] = (pool.submit(provider.corporate_actions, day, bucket // 3), [])
+                pending["NSE market status"] = (submit_traced(pool, provider.market_status, bucket), {})
+            pending["NSE disclosures"] = (submit_traced(pool, provider.disclosures, day), [])
+            pending["NSE corporate actions"] = (submit_traced(pool, provider.corporate_actions, day, bucket // 3), [])
             data = {name: _load(task, fallback, name, warnings) for name, (task, fallback) in pending.items()}
 
         retained = [idea["symbol"].removesuffix(".NS") for idea in current.get("ideas", [])
@@ -444,7 +503,7 @@ class DailyDesk:
         if not before_open:
             budget = self.budget(day)
             with ThreadPoolExecutor(max_workers=8 if paper_active else 6) as pool:
-                tasks = [pool.submit(_scan_asset, asset, day, now, market_open, budget) for asset in candidates]
+                tasks = [submit_traced(pool, _scan_asset, asset, day, now, market_open, budget) for asset in candidates]
                 for asset, task in zip(candidates, tasks, strict=True):
                     updated, bars, found = _load(task, (asset, [], []), asset["symbol"], warnings)
                     if bars:
@@ -456,9 +515,11 @@ class DailyDesk:
         if phase == "open" and market_open:
             try:
                 quotes = provider.live_quotes(scanned, day)
-            except (OSError, ValueError, TypeError, AttributeError):
+            except (OSError, ValueError, TypeError, AttributeError) as exc:
                 quotes = {}
                 warnings.append("The Upstox quote book was unavailable for this scan.")
+                event(logger, "daily.broker_quotes_failed", "Broker quotes were unavailable",
+                      level=logging.WARNING, provider="Upstox", **exception_fields(exc))
             if quotes:
                 for row in scanned:
                     if quote := quotes.get(row["symbol"]):
@@ -467,21 +528,28 @@ class DailyDesk:
                     idea["live_quote"] = quotes.get(idea["symbol"])
         feeds = sorted({row["feed"] for row in scanned if row.get("feed")})
         broker = any(row.get("mode") == "authenticated" for row in scanned)
+        observed_at = datetime.now(IST)
+        if observed_at.date().isoformat() == day and not before_open:
+            venue_report = venue.get("marketStatus", "").strip()
+            # A verified calendar and completed bars are sufficient for paper trading when status is unavailable.
+            paper_open = market_open or not venue_report or (market_date and market_date.date() != now.date())
+            traded = self.paper.advance(observed_at, phase_for(observed_at, self.session), self.budget(day), scanned,
+                                        charts, ideas, bool(paper_open))
+            for symbol, chart in current.get("charts", {}).items():
+                if symbol in traded:
+                    charts.setdefault(symbol, chart)
         self._save(self.path(day, "scan.json"), {
             "day": day, "slot": slot, "updated_at": now.isoformat(), "brief": brief, "session": self.session,
+            "completed_at": observed_at.isoformat(), "scan_id": trace_context().get("scan_id"),
             "candidates": scanned or candidates, "ideas": ideas, "charts": charts, "warnings": warnings,
             "latest_filings": recent_filings,
             "feed": {"name": " · ".join(feeds) or "NSE session data", "mode": "broker" if broker else "reference",
                      "note": "Entry indications also check the current ask, spread, available size, and NSE session." if broker else
                      "Public candles support research and replay. Add an Upstox Analytics Token for broker-confirmed indications."},
         })
-        observed_at = datetime.now(IST)
-        if observed_at.date().isoformat() == day and not before_open:
-            venue_report = venue.get("marketStatus", "").strip()
-            # A verified calendar and completed bars are sufficient for paper trading when status is unavailable.
-            paper_open = market_open or not venue_report or (market_date and market_date.date() != now.date())
-            self.paper.advance(observed_at, phase_for(observed_at, self.session), self.budget(day), scanned,
-                               charts, ideas, bool(paper_open))
+        event(logger, "daily.scan_saved", "Market check saved", phase=phase, slot=slot,
+              symbols=[asset["symbol"] for asset in candidates], charts=len(charts), ideas=len(ideas),
+              providers=feeds, market_confirmed=market_open, filings=len(recent_filings), warnings=warnings)
 
     def view(self, day=None, now=None):
         now = now or datetime.now(IST)
@@ -515,6 +583,10 @@ class DailyDesk:
             **{key: value for key, value in snapshot.items() if key != "charts"},
             "day": day, "budget": budget, "phase": phase, "scheduled": self.enabled,
             "next_scan": next_scan.isoformat() if next_scan else None, "running": self.running,
+            "operation": (self.operation or self.request) if day == today else None,
+            "active_scan_id": self.scan_id if day == today else None,
+            "failed_scan_id": self.failed_scan_id if day == today else None,
+            "check_issue": self.status if day == today else "",
             "candidates": candidates, "ideas": ideas, "warnings": warnings,
             "research": self._read(self.path(day, "replay.json"), None),
             "history": sorted(dates, reverse=True)[:45], "auto_trade": paper,

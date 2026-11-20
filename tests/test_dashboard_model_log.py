@@ -1,4 +1,5 @@
 import json
+import logging
 from uuid import uuid4
 
 import pytest
@@ -49,6 +50,31 @@ def test_model_log_cursor_can_follow_an_incomplete_append(tmp_path):
     assert read_model_log(path, first["offset"])["events"] == [{"type": "finish"}]
     with pytest.raises(ValueError, match="offset"):
         read_model_log(path, 1)
+
+
+def test_model_log_recovers_after_write_failure_and_truncates_an_incomplete_record(tmp_path, monkeypatch, caplog):
+    secret = "an intentionally split private credential"
+    monkeypatch.setenv("TRADINGAGENTS_TUNNEL_PASSWORD", secret)
+    parent = tmp_path / "blocked"
+    parent.write_text("File where the model directory should be")
+    trace = ModelLog(parent / "model_log.jsonl", {})
+    run = uuid4()
+    with caplog.at_level(logging.INFO):
+        trace.on_chat_model_start({}, [], run_id=run)
+        parent.unlink()
+        parent.mkdir()
+        trace.path.write_text('{"type":"tool"}\n{"type":"brok')
+        trace.on_llm_new_token("The provider echoed " + secret[:17], run_id=run)
+        trace.on_llm_new_token(secret[17:] + " in this test.", run_id=run)
+        error = RuntimeError("Authorization: Bearer unknown-auth-credential")
+        trace.on_llm_error(error, run_id=run)
+    events = read_model_log(trace.path, 0)["events"]
+    assert [entry["type"] for entry in events] == ["tool", "start", "delta", "error"]
+    assert events[2]["text"] == "The provider echoed [REDACTED] in this test."
+    assert events[3]["detail"] == "[REDACTED]"
+    assert secret not in trace.path.read_text()
+    assert any(getattr(record, "event_name", None) == "model.log_write_failed" for record in caplog.records)
+    assert any(getattr(record, "event_name", None) == "model.log_recovered" for record in caplog.records)
 
 
 def test_sarvam_stream_adapter_preserves_reasoning_and_usage():

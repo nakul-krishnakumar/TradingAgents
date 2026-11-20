@@ -1,3 +1,4 @@
+import json
 from datetime import datetime
 from decimal import Decimal
 
@@ -46,6 +47,15 @@ def test_automatic_fills_are_forward_only_and_share_cash(tmp_path):
     assert state["orders"] == []
     assert [row["asset"]["symbol"] for row in state["queued"]] == ["AAA.NS", "BBB.NS"]
     assert sum(Decimal(row["reserved"]) for row in state["queued"]) <= 5000
+    checked = state["activity"][0]
+    assert checked["number"] == 1
+    assert checked["at"] == timestamp("09:36")
+    assert checked["mode"] == "checking-buys"
+    assert checked["signals"] == 3
+    assert [row["symbol"] for row in checked["checked"]] == ["AAA.NS", "BBB.NS", "CCC.NS"]
+    assert checked["skipped"] == [{"symbol": "CCC.NS", "strategy": "gap-continuation", "reason": "Cash or risk limit"}]
+    assert [row["asset"]["symbol"] for row in checked["queued"]] == ["AAA.NS", "BBB.NS"]
+    assert not checked["orders"]
 
     reload = DailyPaper(path)
     current = {row["symbol"]: chart(candle("09:35"), candle("09:40")) for row in assets}
@@ -54,7 +64,8 @@ def test_automatic_fills_are_forward_only_and_share_cash(tmp_path):
     reload.advance(when("09:46"), "open", 8000, assets, current, [], True)
     reload.advance(when("09:46"), "open", 8000, assets, current, [], True)
 
-    state = reload.view(DAY)["session"]
+    result = DailyPaper(path).view(DAY)
+    state = result["session"]
     assert state["budget"] == "5000.00"
     assert state["trades"] == 2
     assert state["fills"] == 4
@@ -63,6 +74,16 @@ def test_automatic_fills_are_forward_only_and_share_cash(tmp_path):
     assert all(row["at"] == timestamp("09:40") > row["submitted_at"] for row in buys)
     assert all(row["recorded_at"] == timestamp("09:46") and row["source"] == "Reference candles" for row in buys)
     assert sum(Decimal(str(row["price"])) * row["units"] + Decimal(row["fee"]) for row in buys) <= 5000
+    assert state["buys"] == state["sells"] == 2
+    assert state["total_result"] == state["realized"]
+    assert result["totals"] == {"days": 1, "trades": 2, "wins": 2, "realized": state["realized"]}
+    repeat, filled, waiting, planned = state["activity"]
+    assert repeat["at"] == filled["at"]
+    assert [row["side"] for row in filled["orders"]] == ["buy", "sell", "buy", "sell"]
+    assert all(row["bar_at"] == timestamp("09:40") for row in filled["orders"])
+    assert [row["asset"]["symbol"] for row in planned["queued"]] == ["AAA.NS", "BBB.NS"]
+    assert waiting["waiting"] == 2
+    assert not (repeat["orders"] or waiting["orders"] or planned["orders"])
 
 
 def test_enabling_mid_session_excludes_earlier_signals_and_skips_overshoots(tmp_path):
@@ -79,6 +100,10 @@ def test_enabling_mid_session_excludes_earlier_signals_and_skips_overshoots(tmp_
     session = account.view(DAY)["session"]
     assert session["orders"] == []
     assert session["skipped"] == {"Opening price outside entry range": 1}
+    assert session["activity"][0]["skipped"] == [
+        {"symbol": "AAA.NS", "strategy": "opening-range", "reason": "Opening price outside entry range"}
+    ]
+    assert session["activity"][-1]["signals"] == 0
 
 
 def test_stopping_preserves_positions_and_their_exit_rules(tmp_path):
@@ -88,6 +113,10 @@ def test_stopping_preserves_positions_and_their_exit_rules(tmp_path):
     account.advance(when("09:36"), "open", 5000, assets, {}, signals, True)
     entered = chart(candle("09:40", high=100.3, close=100.1))
     account.advance(when("09:46"), "open", 5000, assets, {"AAA.NS": entered}, [], True)
+    open_session = account.view(DAY)["session"]
+    assert open_session["buys"] == 1 and open_session["sells"] == 0
+    assert Decimal(open_session["realized"]) == 0
+    assert open_session["total_result"] == open_session["unrealized"] == open_session["holdings"][0]["unrealized"]
 
     account.configure(AutoTradeSettings(enabled=False), when("09:47"))
     active, tracking, _ = account.inputs(DAY, when("09:48").time())
@@ -99,6 +128,8 @@ def test_stopping_preserves_positions_and_their_exit_rules(tmp_path):
     assert session["orders"][0]["price"] == 98.9
     assert session["orders"][0]["reason"] == "stop"
     assert Decimal(session["realized"]) < 0
+    assert session["activity"][0]["mode"] == "buys-paused"
+    assert session["activity"][0]["orders"] == [session["orders"][0]]
 
 
 def test_trial_counts_regular_sessions_and_leaves_missing_exits_visible(tmp_path):
@@ -119,6 +150,32 @@ def test_trial_counts_regular_sessions_and_leaves_missing_exits_visible(tmp_path
     assert not result["trial"]["enabled"]
     account.advance(when("09:21", "2026-11-20"), "open", 5000, [], {}, [], True)
     assert [item["day"] for item in account.view(DAY)["history"]] == [DAY]
+
+
+def test_earlier_days_keep_trades_without_detailed_checks(tmp_path):
+    path = tmp_path / "auto.json"
+    account = DailyPaper(path)
+    assets, signals = assets_and_signals(["AAA.NS"])
+    account.configure(AutoTradeSettings(enabled=True), when("09:00"))
+    account.advance(when("09:36"), "open", 5000, assets, {}, signals, True)
+    account.advance(when("09:46"), "open", 5000, assets, {"AAA.NS": chart(candle("09:40"))}, [], True)
+    prior = account.view(DAY)
+    stored = json.loads(path.read_text())
+    del stored["books"][DAY]["activity"]
+    for order in stored["books"][DAY]["orders"]:
+        order.pop("bar_at")
+        order.pop("signal_reason")
+    path.write_text(json.dumps(stored))
+
+    result = account.view(DAY)
+    assert result["session"]["activity"] == []
+    assert result["session"]["fills"] == 2
+    assert result["totals"] == prior["totals"]
+    account.advance(when("09:51"), "open", 5000, assets, {}, [], True)
+    result = account.view(DAY)
+    assert result["session"]["activity"][0]["number"] == 3
+    assert result["session"]["activity"][0]["orders"] == []
+    assert result["totals"] == prior["totals"]
 
 
 def test_paper_scans_rotate_beyond_watchlist_and_keep_open_symbols():

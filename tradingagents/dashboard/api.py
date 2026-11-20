@@ -14,9 +14,12 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from cli.prompts import detect_asset_type, parse_analysis_date
 from tradingagents.backtest import iter_grid
@@ -24,12 +27,20 @@ from tradingagents.dataflows.config import run_config
 from tradingagents.dataflows.date_window import get_current_date
 from tradingagents.dataflows.files import locked
 from tradingagents.default_config import build_default_config
+from tradingagents.diagnostics import configure_logging, event, exception_fields, submit_traced
 from tradingagents.memory import TradingMemoryLog
 from tradingagents.reporting import research_summary
 
 from .codex_service import managed_bridge
 from .daily_desk import DailyBudget, DailyDesk
 from .daily_paper import AutoTradeSettings
+from .debug_api import (
+    RequestLogMiddleware,
+    diagnostics_router,
+    handled_http_error,
+    unexpected_http_error,
+    validation_error,
+)
 from .jobs import BacktestRequest, JobStore, ResearchRequest, provider_status, validate_analysts
 from .market import (
     DEFAULTS,
@@ -42,7 +53,7 @@ from .market import (
     search_funds,
     search_yahoo,
 )
-from .model_log import MODEL_LOG, read_model_log
+from .model_log import MODEL_LOG, model_log_lines, read_model_log
 from .screener import quick_search_bonds
 from .workspace_api import workspace_router
 
@@ -65,6 +76,8 @@ TUNNEL_CHALLENGE = 'Basic realm="Market Desk", charset="UTF-8"'
 
 @asynccontextmanager
 async def lifespan(_app):
+    configure_logging("market-desk", CONFIG["results_dir"])
+    event(logger, "service.starting", "Starting the Market Desk API", tunnel=TUNNEL_MODE)
     JOBS.directory.mkdir(parents=True, exist_ok=True)
     with locked(JOBS.directory / "worker", wait=False) as acquired:
         if not acquired:
@@ -72,13 +85,16 @@ async def lifespan(_app):
         with managed_bridge(CONFIG):
             JOBS.start()
             DAILY.start()
+            event(logger, "service.ready", "Market Desk and the daily scheduler are ready", scheduled=DAILY.enabled)
             try:
                 yield
             finally:
                 DAILY.stop()
+                event(logger, "service.stopped", "Market Desk API stopped")
 
 
 app = FastAPI(title="TradingAgents Dashboard", lifespan=lifespan, docs_url=None, redoc_url=None)
+app.add_middleware(GZipMiddleware, minimum_size=4096, compresslevel=4)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=[
     "127.0.0.1", "localhost", "[::1]", *(["*.trycloudflare.com"] if TUNNEL_MODE else []),
 ])
@@ -100,14 +116,17 @@ async def local_requests(request: Request, call_next):
     if TUNNEL_AUTH is not None:
         scheme, _, supplied = request.headers.get("authorization", "").partition(" ")
         if scheme.casefold() != "basic" or not hmac.compare_digest(supplied.strip().encode(), TUNNEL_AUTH):
+            event(logger, "http.authentication_failed", "Tunnel sign-in was rejected", level=logging.WARNING)
             return JSONResponse({"detail": "Sign in to Market Desk."}, status_code=401, headers={
                 "WWW-Authenticate": TUNNEL_CHALLENGE, "Cache-Control": "no-store",
             })
     if request.method in ("POST", "DELETE"):
         origin = request.headers.get("origin")
         if origin and not origin_allowed(origin, request.url.hostname):
+            event(logger, "http.origin_rejected", "An API write came from another origin", level=logging.WARNING)
             return JSONResponse({"detail": "Use the Market Desk page to start a run."}, status_code=403)
         if request.method == "POST" and request.headers.get("content-type", "").split(";")[0] != "application/json":
+            event(logger, "http.content_type_rejected", "An API write was missing its JSON content type", level=logging.WARNING)
             return JSONResponse({"detail": "Send a JSON request."}, status_code=415)
     response = await call_next(request)
     if TUNNEL_MODE or request.url.path.startswith("/api/"):
@@ -115,7 +134,12 @@ async def local_requests(request: Request, call_next):
     return response
 
 
+app.add_middleware(RequestLogMiddleware)
+app.add_exception_handler(StarletteHTTPException, handled_http_error)
+app.add_exception_handler(RequestValidationError, validation_error)
+app.add_exception_handler(Exception, unexpected_http_error)
 app.include_router(workspace_router(CONFIG))
+app.include_router(diagnostics_router(CONFIG["results_dir"]))
 
 
 def _read_job(identifier: str) -> dict:
@@ -173,7 +197,7 @@ def daily_chart(symbol: str, day: calendar_date):
 
 @app.get("/api/daily/model-log")
 def daily_model_log(day: calendar_date, offset: int = Query(default=0, ge=0)):
-    return read_model_log(DAILY.path(day.isoformat(), MODEL_LOG), offset)
+    return _validate(read_model_log, DAILY.path(day.isoformat(), MODEL_LOG), offset)
 
 
 @app.get("/api/daily/model-log/download")
@@ -181,7 +205,9 @@ def daily_model_log_download(day: calendar_date):
     path = DAILY.path(day.isoformat(), MODEL_LOG)
     if not path.is_file():
         raise HTTPException(404, "No model log was recorded for this session.")
-    return FileResponse(path, media_type="application/x-ndjson", filename=f"daily-model-log-{day.isoformat()}.jsonl")
+    return StreamingResponse(model_log_lines(path), media_type="application/x-ndjson", headers={
+        "Content-Disposition": f'attachment; filename="daily-model-log-{day.isoformat()}.jsonl"',
+    })
 
 
 @app.get("/api/search")
@@ -206,16 +232,17 @@ def search(q: str = Query(min_length=1, max_length=100), mode: str = "all"):
     with ThreadPoolExecutor(max_workers=3) as pool:
         sources = {}
         if mode in ("all", "listed"):
-            sources[pool.submit(search_yahoo, query)] = "Yahoo Finance search"
+            sources[submit_traced(pool, search_yahoo, query)] = "Yahoo Finance search"
         if mode in ("all", "funds"):
-            sources[pool.submit(search_funds, query, get_current_date())] = "AMFI search"
+            sources[submit_traced(pool, search_funds, query, get_current_date())] = "AMFI search"
         if mode == "bonds" or (mode == "all" and len(query) >= 3):
-            sources[pool.submit(quick_search_bonds, query, get_current_date())] = "NSE debt directory"
+            sources[submit_traced(pool, quick_search_bonds, query, get_current_date())] = "NSE debt directory"
         for future, source in sources.items():
             try:
                 results.extend(future.result())
             except Exception as exc:
-                logger.info("%s unavailable (%s)", source, type(exc).__name__)
+                event(logger, "data.search_failed", "An investment search source failed",
+                      level=logging.WARNING, source=source, **exception_fields(exc))
                 unavailable.append(source)
     deduplicated = {item["symbol"]: item for item in results}
     selected = list(deduplicated.values())
@@ -234,7 +261,8 @@ def chart(symbol: str, date: str | None = None, kind: str | None = None):
         with run_config(CONFIG):
             return chart_data(ticker, day, CONFIG, kind)
     except Exception as exc:
-        logger.info("Price source for %s unavailable (%s)", ticker, type(exc).__name__)
+        event(logger, "data.chart_failed", "A price chart could not be loaded",
+              level=logging.WARNING, symbol=ticker, date=day, **exception_fields(exc))
         detail = str(exc) if isinstance(exc, ValueError) else f"Price history for {ticker} is temporarily unavailable."
         raise HTTPException(503, detail) from None
 
@@ -259,13 +287,9 @@ def model_log(identifier: str, offset: int = Query(default=0, ge=0)):
 def download_model_log(identifier: str):
     _read_job(identifier)
     path = JOBS.directory / identifier / MODEL_LOG
-    try:
-        contents = path.read_bytes()
-    except FileNotFoundError as exc:
-        raise HTTPException(404, "Model log unavailable.") from exc
-    # The running job can grow the file while a browser downloads it. Send a
-    # snapshot of complete records with a fixed content length.
-    return Response(contents[:contents.rfind(b"\n") + 1], media_type="application/x-ndjson", headers={
+    if not path.is_file():
+        raise HTTPException(404, "Model log unavailable.")
+    return StreamingResponse(model_log_lines(path), media_type="application/x-ndjson", headers={
         "Content-Disposition": f'attachment; filename="model-log-{identifier}.jsonl"',
     })
 
@@ -386,3 +410,14 @@ def dashboard():
     if (DIST / "index.html").is_file():
         return FileResponse(DIST / "index.html")
     return JSONResponse({"detail": "Build the UI with npm --prefix web run build or start the Vite development server."}, status_code=503)
+
+
+if __name__ == "__main__":
+    import sys
+    from logging.config import dictConfig
+
+    import uvicorn
+
+    dictConfig(uvicorn.config.LOGGING_CONFIG)
+    configure_logging("market-desk", CONFIG["results_dir"])
+    uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), access_log=False, log_config=None)

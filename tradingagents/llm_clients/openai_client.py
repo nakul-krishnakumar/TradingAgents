@@ -5,12 +5,15 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
+from uuid import uuid4
 
 from langchain_core.messages import AIMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.utils.function_calling import convert_to_openai_function
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
+
+from tradingagents.diagnostics import diagnostic_context, trace_headers
 
 from .api_key_env import get_api_key_env
 from .base_client import BaseLLMClient, normalize_content
@@ -100,6 +103,32 @@ class CodexChatOpenAI(NormalizedChatOpenAI):
         if generation is not None and isinstance(summary, str) and summary:
             generation.message.additional_kwargs["codex_reasoning_summary"] = summary
         return generation
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        if headers := trace_headers():
+            kwargs["extra_headers"] = {**headers, **(kwargs.get("extra_headers") or {})}
+        return super()._get_request_payload(input_, stop=stop, **kwargs)
+
+    def _generate_with_cache(self, messages, stop=None, run_manager=None, **kwargs):
+        with diagnostic_context(call_id=str(run_manager.run_id) if run_manager else None):
+            return super()._generate_with_cache(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    async def _agenerate_with_cache(self, messages, stop=None, run_manager=None, **kwargs):
+        with diagnostic_context(call_id=str(run_manager.run_id) if run_manager else None):
+            return await super()._agenerate_with_cache(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+    def stream(self, input, config=None, **kwargs):
+        options = dict(config or {})
+        options["run_id"] = options.get("run_id") or uuid4()
+        kwargs["extra_headers"] = {**(kwargs.get("extra_headers") or {}), **trace_headers(call_id=str(options["run_id"]))}
+        return super().stream(input, config=options, **kwargs)
+
+    async def astream(self, input, config=None, **kwargs):
+        options = dict(config or {})
+        options["run_id"] = options.get("run_id") or uuid4()
+        kwargs["extra_headers"] = {**(kwargs.get("extra_headers") or {}), **trace_headers(call_id=str(options["run_id"]))}
+        async for chunk in super().astream(input, config=options, **kwargs):
+            yield chunk
 
 
 class SarvamStreamingChatOpenAI(LocalCompatibleChatOpenAI):

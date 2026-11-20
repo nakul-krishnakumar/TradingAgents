@@ -3,12 +3,13 @@ import {
   CandlestickSeries, HistogramSeries, LineSeries, LineStyle, createChart, createSeriesMarkers,
 } from 'lightweight-charts';
 import { money } from './api';
+import { Help } from './Help';
 
 const clock = new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 const formatTime = (time) => clock.format(time * 1000);
 const levels = [
-  ['trigger', 'Trigger', '#166c57'], ['entry_cap', 'Entry cap', '#607c72'],
-  ['stop', 'Stop', '#ac4649'], ['target', 'Target', '#5d51a3'],
+  ['trigger', 'Buy from', '#166c57'], ['entry_cap', 'Most to pay', '#607c72'],
+  ['stop', 'Limit loss', '#ac4649'], ['target', 'Take profit', '#5d51a3'],
 ];
 
 function markerTime(bars, value, includesEnd) {
@@ -19,7 +20,7 @@ function markerTime(bars, value, includesEnd) {
   return bar?.time ?? bars.find(({ time }) => time === stamp)?.time ?? null;
 }
 
-export function DailyChart({ bars, idea, symbol, day }) {
+export function DailyChart({ bars, idea, symbol, day, orders }) {
   const container = useRef(null);
   const instances = useRef(null);
   const [hover, setHover] = useState(null);
@@ -79,17 +80,24 @@ export function DailyChart({ bars, idea, symbol, day }) {
     })] : []);
     const entry = Number.isFinite(idea?.entry) ? markerTime(bars, idea.entry_at, false) : null;
     const exit = Number.isFinite(idea?.exit_price) ? markerTime(bars, idea.exit_at, idea.status !== 'time-exit') : null;
-    view.markers.setMarkers([
-      ...(entry ? [{ time: entry, position: 'belowBar', color: '#08765e', shape: 'arrowUp', text: 'Entry' }] : []),
-      ...(exit ? [{ time: exit, position: 'aboveBar', color: '#ac4649', shape: 'arrowDown', text: 'Exit' }] : []),
-    ].sort((a, b) => a.time - b.time));
-  }, [bars, idea, symbol, day]);
+    const markers = orders.length ? orders.flatMap((order) => {
+      const time = order.bar_at ?? markerTime(bars, order.at, order.side === 'sell' && ['stop', 'target'].includes(order.reason));
+      if (!bars.some((bar) => bar.time === time)) return [];
+      return order.side === 'buy' ? [{ time, position: 'belowBar', color: '#08765e', shape: 'arrowUp', text: 'BUY', size: 1.35 }]
+        : [{ time, position: 'aboveBar', color: '#a83e42', shape: 'arrowDown', text: 'SELL', size: 1.35 }];
+    }) : [
+      ...(entry ? [{ time: entry, position: 'belowBar', color: '#08765e', shape: 'arrowUp', text: 'Example buy' }] : []),
+      ...(exit ? [{ time: exit, position: 'aboveBar', color: '#ac4649', shape: 'arrowDown', text: 'Example sell' }] : []),
+    ];
+    view.markers.setMarkers(markers.sort((a, b) => a.time - b.time));
+  }, [bars, idea, orders, symbol, day]);
 
   return <>
-    {selected && <div className="daily-ohlc" aria-label="Selected candle data">
+    {selected && <div className="daily-ohlc" aria-label="Selected five-minute price range">
       <time dateTime={new Date(selected.time * 1000).toISOString()}>{formatTime(selected.time)} IST</time>
-      {[['open', 'O'], ['high', 'H'], ['low', 'L'], ['close', 'C']].map(([field, label]) => <span key={field}>{label} <strong>{money(selected[field], 'INR')}</strong></span>)}
+      {[['open', 'Open'], ['high', 'High'], ['low', 'Low'], ['close', 'Close']].map(([field, label]) => <span key={field}>{label} <strong>{money(selected[field], 'INR')}</strong></span>)}
+      <Help label="Five-minute prices" text="Open is the first price in this interval, high and low are its extremes, and close is the last price. Move over a different bar to see the figures for that time." />
     </div>}
-    <div className="daily-chart-canvas" ref={container} role="img" aria-label={`${symbol} intraday candlesticks, volume, session VWAP and trade plan levels`} />
+    <div className="daily-chart-canvas" ref={container} role="img" aria-label={`${symbol} prices and shares traded through the day${orders.length ? ' with paper BUY and SELL markers' : ''}`} />
   </>;
 }

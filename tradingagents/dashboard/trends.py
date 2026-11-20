@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
@@ -11,6 +12,7 @@ from urllib.parse import urlsplit
 
 from tradingagents.dataflows.vendors import nse
 from tradingagents.dataflows.vendors.amfi import fund_directory, latest_previous_navs
+from tradingagents.diagnostics import event, exception_fields, submit_traced
 
 from .market import instrument
 from .screener import _day, _num, latest_snapshot
@@ -20,6 +22,7 @@ NSE_FLOWS = "https://www.nseindia.com/reports/fii-dii"
 NSE_FILINGS = "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
 NSE_VIX = "https://www.nseindia.com/static/products-services/indices-indiavix-index"
 NSE_ETFS = "https://www.nseindia.com/market-data/exchange-traded-funds-etf"
+logger = logging.getLogger(__name__)
 
 
 def _indices(payload):
@@ -105,11 +108,11 @@ def _filings(payload):
 def market_trends(day: str, bucket: int):
     with ThreadPoolExecutor(max_workers=6) as pool:
         sources = {
-            "Market breadth": pool.submit(nse.market_indices, bucket),
-            "NSE stocks": pool.submit(latest_snapshot, day, "stock"),
-            "NSE ETFs": pool.submit(latest_snapshot, day, "etf"),
-            "Institutional flows": pool.submit(nse.institutional_flows, bucket),
-            "NSE filings": pool.submit(nse.equity_filings, bucket),
+            "Market breadth": submit_traced(pool, nse.market_indices, bucket),
+            "NSE stocks": submit_traced(pool, latest_snapshot, day, "stock"),
+            "NSE ETFs": submit_traced(pool, latest_snapshot, day, "etf"),
+            "Institutional flows": submit_traced(pool, nse.institutional_flows, bucket),
+            "NSE filings": submit_traced(pool, nse.equity_filings, bucket),
         }
         data, unavailable = {}, []
         for name, future in sources.items():
@@ -117,6 +120,8 @@ def market_trends(day: str, bucket: int):
                 data[name] = future.result()
             except (OSError, ValueError, KeyError) as exc:
                 unavailable.append(f"{name} ({type(exc).__name__})")
+                event(logger, "market_trends.source_failed", "Market trends data was unavailable",
+                      level=logging.WARNING, source=name, date=day, **exception_fields(exc))
     labels = ("NSE stocks", "NSE ETFs")
     for label in labels:
         if label in data and not data[label]["session"]:

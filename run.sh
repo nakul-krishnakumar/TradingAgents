@@ -6,6 +6,26 @@ cd "$repo_dir"
 export TZ=Asia/Kolkata
 port="${TRADINGAGENTS_PORT:-8765}"
 mode=local
+startup_stage=arguments
+
+log_setup() {
+  local stage="$1" status="$2" log_python
+  log_python="$repo_dir/.venv/bin/python"
+  if [[ ! -x "$log_python" ]]; then
+    log_python="$(command -v python3 || true)"
+  fi
+  if [[ -n "$log_python" ]]; then
+    "$log_python" "$repo_dir/tradingagents/diagnostics.py" "$stage" "$status" || true
+  fi
+}
+
+log_setup_exit() {
+  local status="$1"
+  if (( status != 0 )); then
+    log_setup "$startup_stage" "$status"
+  fi
+}
+trap 'log_setup_exit "$?"' EXIT
 
 if [[ $# -eq 1 && "$1" == --tunnel ]]; then
   mode=tunnel
@@ -19,6 +39,8 @@ if [[ ! "$port" =~ ^[1-9][0-9]{0,4}$ ]] || (( port > 65535 )); then
   exit 2
 fi
 
+startup_stage=python_environment
+log_setup "$startup_stage" 0
 if [[ ! -x .venv/bin/python ]]; then
   if command -v uv >/dev/null 2>&1; then
     uv venv --python 3.13 .venv
@@ -29,6 +51,7 @@ fi
 python="$repo_dir/.venv/bin/python"
 
 port_status=0
+startup_stage=port_check
 "$python" - "$port" "$mode" <<'PY' || port_status=$?
 import json
 import socket
@@ -71,6 +94,7 @@ node_is_supported() {
   ' >/dev/null 2>&1
 }
 
+startup_stage=node_runtime
 if ! node_is_supported; then
   node_bin="$("$python" tradingagents/dashboard/node_runtime.py "$repo_dir/.venv")"
   export PATH="$node_bin:$PATH"
@@ -80,6 +104,7 @@ if ! node_is_supported; then
   fi
 fi
 
+startup_stage=python_dependencies
 python_ready=.venv/.market-desk-installed
 if [[ ! -f "$python_ready" || pyproject.toml -nt "$python_ready" || requirements.txt -nt "$python_ready" ]] ||
   ! "$python" -c 'import fastapi, uvicorn, openpyxl, langgraph, yfinance' >/dev/null 2>&1; then
@@ -91,10 +116,14 @@ if [[ ! -f "$python_ready" || pyproject.toml -nt "$python_ready" || requirements
   touch "$python_ready"
 fi
 
+startup_stage=web_dependencies
 if [[ ! -x web/node_modules/.bin/vite || ! -f web/node_modules/.package-lock.json ||
       web/package-lock.json -nt web/node_modules/.package-lock.json ]]; then
   npm --prefix web ci --include=dev
 fi
+startup_stage=web_build
 npm --prefix web run build
 
+startup_stage=services
+log_setup "$startup_stage" 0
 exec "$python" -m tradingagents.dashboard.launcher "$port" "$mode"

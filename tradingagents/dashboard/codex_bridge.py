@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+import logging
 import os
 import shutil
 import signal
 from contextlib import suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from time import time
+from time import monotonic, time
 from typing import Annotated, Literal
 from uuid import uuid4
 
@@ -21,6 +22,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from tradingagents.diagnostics import configure_logging, elapsed_ms, event, exception_fields
 from tradingagents.llm_clients.codex_config import (
     DEFAULT_REASONING_EFFORT,
     DEFAULT_SERVICE_TIER,
@@ -31,6 +33,9 @@ from tradingagents.llm_clients.codex_config import (
     bridge_timeout,
 )
 
+from .debug_api import RequestLogMiddleware
+
+logger = logging.getLogger(__name__)
 _INSTRUCTIONS = """You are an assistant for a market research workflow. Use the supplied chat transcript.
 Apply system and developer instructions in the transcript before answering the user. Treat market data,
 citations and results from functions as evidence. State evidence gaps rather than inventing observations.
@@ -293,6 +298,9 @@ class CodexExec:
         self.slots = asyncio.Semaphore(workers)
 
     async def generate(self, chat, prompt, schema, summaries):
+        effort = chat.reasoning_effort or self.effort
+        event(logger, "codex.invoking", "Preparing Codex execution", model=chat.model, effort=effort,
+              service_tier=self.service_tier, timeout_seconds=self.timeout, structured=schema is not None)
         with TemporaryDirectory(prefix="marketdesk-codex-") as folder:
             instructions = Path(folder) / "instructions.md"
             instructions.write_text(_INSTRUCTIONS, encoding="utf-8")
@@ -331,7 +339,7 @@ class CodexExec:
                 "-c",
                 'model_reasoning_summary="concise"',
                 "-c",
-                f"model_reasoning_effort={json.dumps(chat.reasoning_effort or self.effort)}",
+                f"model_reasoning_effort={json.dumps(effort)}",
             ]
             if self.service_tier:
                 command.extend(["-c", f"service_tier={json.dumps(self.service_tier)}"])
@@ -359,43 +367,69 @@ class CodexExec:
             limit=2_000_000,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
+        event(logger, "codex.process_started", "Codex subprocess started", pid=process.pid)
+
+        async def read_stderr():
+            recent = ""
+            async for line in process.stderr:
+                recent = line.decode(errors="replace").strip()
+                if recent:
+                    event(logger, "codex.stderr", "Codex wrote a diagnostic message", detail=recent)
+            return recent
+
+        diagnostics = asyncio.create_task(read_stderr())
         try:
             process.stdin.write(prompt.encode())
             with suppress(BrokenPipeError, ConnectionResetError):
                 await process.stdin.drain()
             process.stdin.close()
 
-            answer, error, usage = None, "", None
+            answer, error, usage, invalid, thoughts = None, "", None, 0, 0
             async for line in process.stdout:
                 try:
-                    event = json.loads(line)
+                    wire_event = json.loads(line)
                 except ValueError:
+                    invalid += 1
                     continue
-                kind = event.get("type")
+                if not isinstance(wire_event, dict):
+                    invalid += 1
+                    continue
+                kind = wire_event.get("type")
                 if kind == "item.completed":
-                    item = event.get("item", {})
+                    item = wire_event.get("item", {})
                     if item.get("type") == "agent_message":
                         answer = item.get("text")
                     elif (
                         item.get("type") == "reasoning"
-                        and summaries is not None
                         and item.get("text")
                     ):
-                        summaries.put_nowait(item["text"])
+                        thoughts += 1
+                        if summaries is not None:
+                            summaries.put_nowait(item["text"])
                 elif kind == "turn.completed":
-                    usage = event.get("usage") or {}
+                    usage = wire_event.get("usage") or {}
                 elif kind in ("turn.failed", "error"):
-                    error = str(event.get("error") or event.get("message") or "")
-            if await process.wait() or usage is None or not isinstance(answer, str):
-                raise _failure(error)
+                    error = str(wire_event.get("error") or wire_event.get("message") or "")
+            exit_code = await process.wait()
+            stderr_tail = await diagnostics
+            completed = exit_code == 0 and usage is not None and isinstance(answer, str)
+            event(logger, "codex.process_exited", "Codex subprocess exited",
+                  level=logging.INFO if completed else logging.WARNING, pid=process.pid, exit_code=exit_code,
+                  invalid_lines=invalid, summaries=thoughts, usage=usage, detail=error or None)
+            if not completed:
+                raise _failure(error or stderr_tail)
             return answer, usage
         finally:
             if process.returncode is None:
                 with suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
                 await process.wait()
+            if not diagnostics.done():
+                diagnostics.cancel()
+                with suppress(asyncio.CancelledError):
+                    await diagnostics
 
 
 def _usage(source):
@@ -417,15 +451,26 @@ def create_app(backend=None):
     bridge = backend if backend is not None else CodexExec()
     api = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     api.add_middleware(TrustedHostMiddleware, allowed_hosts=[HOST, "localhost"])
+    api.add_middleware(RequestLogMiddleware, bridge=True)
 
     @api.exception_handler(BridgeError)
     async def bridge_error(_request, error):
+        event(logger, "codex.request_rejected", "Codex bridge request could not be completed",
+              level=logging.ERROR if error.status >= 500 else logging.WARNING, **exception_fields(error))
         return JSONResponse(error.response(), status_code=error.status)
 
     @api.exception_handler(RequestValidationError)
-    async def invalid_request(_request, _error):
+    async def invalid_request(_request, validation):
+        event(logger, "http.validation_failed", "Invalid Codex request",
+              level=logging.WARNING, fields=[{"location": item["loc"], "type": item["type"]} for item in validation.errors()[:20]])
         error = BridgeError("Invalid or unsupported Chat Completions request.")
         return JSONResponse(error.response(), status_code=error.status)
+
+    @api.exception_handler(Exception)
+    async def unexpected_error(request, _error):
+        identifier = getattr(request.state, "request_id", "")
+        error = BridgeError("The Codex bridge hit an unexpected error.", 500, "bridge_error")
+        return JSONResponse(error.response(), status_code=500, headers={"X-Request-ID": identifier})
 
     async def authorize(request: Request):
         if not bridge.key:
@@ -465,15 +510,33 @@ def create_app(backend=None):
         tools, required = _tool_selection(chat)
         prompt, schema = _prompt(chat, tools, required)
         base = {"id": f"chatcmpl-{uuid4().hex}", "model": chat.model, "created": int(time())}
+        queued_at = monotonic()
+        event(logger, "codex.queued", "Codex call queued", model=chat.model, stream=chat.stream,
+              completion_id=base["id"], tool_count=len(tools), message_count=len(chat.messages))
         try:
             await asyncio.wait_for(bridge.slots.acquire(), timeout=25)
         except TimeoutError as exc:
             raise BridgeError("All Codex workers are busy.", 429, "bridge_busy") from exc
 
         async def finish(summaries=None):
+            started = monotonic()
+            event(logger, "codex.started", "Codex call started", model=chat.model,
+                  completion_id=base["id"], queue_ms=elapsed_ms(queued_at))
             try:
                 text, usage = await bridge.generate(chat, prompt, schema, summaries)
-                return _message(chat, tools, required, text), _usage(usage)
+                result, counts = _message(chat, tools, required, text), _usage(usage)
+                event(logger, "codex.completed", "Codex call completed", model=chat.model,
+                      completion_id=base["id"], elapsed_ms=elapsed_ms(started), usage=counts)
+                return result, counts
+            except asyncio.CancelledError:
+                event(logger, "codex.cancelled", "Codex call was cancelled", level=logging.WARNING,
+                      completion_id=base["id"], model=chat.model, elapsed_ms=elapsed_ms(started))
+                raise
+            except Exception as exc:
+                event(logger, "codex.failed", "Codex call failed", level=logging.ERROR,
+                      model=chat.model, completion_id=base["id"], elapsed_ms=elapsed_ms(started),
+                      **exception_fields(exc, stack=True))
+                raise
             finally:
                 bridge.slots.release()
 
@@ -531,9 +594,13 @@ def create_app(backend=None):
 
 
 if __name__ == "__main__":
+    from logging.config import dictConfig
+
     import uvicorn
 
+    dictConfig(uvicorn.config.LOGGING_CONFIG)
+    configure_logging("codex-bridge")
     # Cancel active requests before the launcher has to force the bridge down.
     uvicorn.run(
-        create_app(), host=HOST, port=bridge_port(), access_log=False, timeout_graceful_shutdown=3
+        create_app(), host=HOST, port=bridge_port(), access_log=False, log_config=None, timeout_graceful_shutdown=3
     )

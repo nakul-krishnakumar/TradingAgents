@@ -80,6 +80,8 @@ def test_a_file_held_open_elsewhere_keeps_its_old_content(monkeypatch, tmp_path)
 
     monkeypatch.setattr(files.os, "replace", locked)
     files.replace_file(target, lambda temp: Path(temp).write_text("new"))
+    with pytest.raises(PermissionError, match="in use"):
+        files.replace_file(target, lambda temp: Path(temp).write_text("must save"), strict=True)
 
     assert target.read_text() == "old"
     assert list(tmp_path.iterdir()) == [target]

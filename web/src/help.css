@@ -1,0 +1,63 @@
+.help-heading, .help-inline {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+}
+.help-heading { gap: 7px; }
+.help-heading > :is(h1, h2, h3, h4) { min-width: 0; overflow-wrap: anywhere; }
+.help-inline { display: inline-flex; vertical-align: middle; }
+.help-inline > :first-child { min-width: 0; }
+.help-field { display: grid; gap: 5px; align-content: start; min-width: 0; }
+.help-field label { font-size: .82rem; font-weight: 590; }
+
+.help-trigger {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  min-height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: #507365;
+  cursor: help;
+  vertical-align: middle;
+}
+.help-trigger:hover, .help-trigger[aria-expanded=true] { color: #086047; background-color: #e5f4eb; }
+.help-trigger:focus-visible { outline: 2px solid #148266; outline-offset: 1px; }
+.sidebar .help-trigger, .paper-result-main .help-trigger { color: #b2d9c7; }
+.sidebar .help-trigger:hover, .sidebar .help-trigger[aria-expanded=true],
+.paper-result-main .help-trigger:hover, .paper-result-main .help-trigger[aria-expanded=true] {
+  color: #e0ffef;
+  background-color: #ffffff20;
+}
+.sidebar .help-trigger:focus-visible, .paper-result-main .help-trigger:focus-visible { outline-color: #a5e8cb; }
+
+.help-disclosure { position: relative; min-width: 0; --help-top: 0px; --help-edge: 0px; }
+.help-disclosure > details > summary { padding-inline-end: calc(28px + var(--help-edge)); }
+.help-disclosure > .help-trigger { position: absolute; inset-block-start: var(--help-top); inset-inline-end: var(--help-edge); }
+
+.help-tip {
+  z-index: 40;
+  width: min(310px, calc(100vw - 24px));
+  padding: 11px 13px;
+  border: 1px solid #366352;
+  border-radius: 10px;
+  color: #f0fbf5;
+  background: #162f26;
+  box-shadow: 0 7px 25px #10241f38;
+  text-align: left;
+  white-space: normal;
+}
+.help-tip strong { display: block; margin-bottom: 4px; font-size: .83rem; font-weight: 690; overflow-wrap: anywhere; }
+.help-tip p { margin: 0; color: #d4ede0; font-size: .82rem; line-height: 1.46; overflow-wrap: anywhere; }
+.help-arrow { fill: #162f26; }
+
+@media (pointer: coarse) {
+  .help-trigger { min-width: 24px; min-height: 24px; width: 24px; height: 24px; }
+}

@@ -12,6 +12,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
 from tradingagents.dataflows.vendors import india_intraday as provider
+from tradingagents.diagnostics import event, exception_fields, submit_traced
 from tradingagents.llm_clients.codex_config import PROVIDER as CODEX
 from tradingagents.llm_clients.factory import create_tier_client, tier_provider
 
@@ -54,6 +55,8 @@ def daily_brief(candidates, filings, config, log_file, skill, premarket, sources
     tiers = provider_status(config)
     enabled = [tier for tier in ("quick", "deep") if tiers[tier]["ready"]]
     if not enabled:
+        event(logger, "daily.brief_provider_unavailable", "Morning brief used exchange data because no model tier was ready",
+              level=logging.WARNING)
         return result
     log_file.parent.mkdir(parents=True, exist_ok=True)
     logger_callback = ModelLog(log_file, tiers)
@@ -72,6 +75,7 @@ def daily_brief(candidates, filings, config, log_file, skill, premarket, sources
     ]
     for tier in enabled:
         try:
+            event(logger, "daily.brief_model_started", "Morning research model started", tier=tier, provider=tiers[tier]["provider"])
             timeout = 90 if tier_provider(config, tier) == CODEX else 30
             llm = create_tier_client({**config, "llm_max_retries": 0, "max_tokens": 3000, "stream_model_output": True},
                                      tier, timeout=timeout).get_llm()
@@ -80,10 +84,15 @@ def daily_brief(candidates, filings, config, log_file, skill, premarket, sources
                                   "metadata": {"langgraph_node": "Daily trading premarket research"}},
             )
             if note:
+                event(logger, "daily.brief_model_completed", "Morning research model returned a brief",
+                      tier=tier, provider=tiers[tier]["provider"], observations=len(note.observations))
                 return {**result, "summary": note.summary, "context": [*note.observations, *context],
                         "method": tiers[tier]["provider"]}
         except Exception as exc:
-            logger.info("Daily brief %s tier unavailable (%s)", tier, type(exc).__name__)
+            event(logger, "daily.brief_model_failed", "Morning research model was unavailable",
+                  level=logging.WARNING, tier=tier, provider=tiers[tier]["provider"], **exception_fields(exc, stack=True))
+        finally:
+            logger_callback.flush()
     result["context"].append("The model brief is unavailable. The exchange brief and filing links are shown.")
     return result
 
@@ -128,12 +137,13 @@ def replay_summary(candidates, day, budget):
     unresolved = defaultdict(int)
     symbols, tests = [], 0
     with ThreadPoolExecutor(max_workers=4) as pool:
-        pending = [(item["symbol"], pool.submit(_replay_asset, item, through, budget)) for item in assets]
+        pending = [(item["symbol"], submit_traced(pool, _replay_asset, item, through, budget)) for item in assets]
         for symbol, work in pending:
             try:
                 dates, outcomes = work.result()
             except Exception as exc:
-                logger.info("Daily replay source unavailable for %s (%s)", symbol, type(exc).__name__)
+                event(logger, "daily.replay_source_failed", "History was unavailable for the strategy test",
+                      level=logging.WARNING, symbol=symbol, **exception_fields(exc))
                 continue
             if dates:
                 symbols.append(symbol)

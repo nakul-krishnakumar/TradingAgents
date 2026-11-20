@@ -11,14 +11,15 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-def replace_file(path, write: Callable[[str], None]) -> None:
+def replace_file(path, write: Callable[[str], None], *, strict: bool = False) -> None:
     """Write ``path`` through a uniquely named temp file beside it, then move it into place.
 
     A reader sees the old file or the new one, never a partial write, and two
     writers of the same path (tool calls run concurrently) never share a temp file.
     ``write`` receives the temp path and creates the file, so it gets the usual
     permissions. The file is a cache: where another reader holds it open (Windows),
-    the old one stays and the write is skipped.
+    the old one stays and the write is skipped. Set strict for persisted records
+    whose caller must know if the replacement failed.
     """
     path = Path(path)
     temp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
@@ -27,6 +28,8 @@ def replace_file(path, write: Callable[[str], None]) -> None:
         os.replace(temp, path)
     except PermissionError as exc:
         temp.unlink(missing_ok=True)
+        if strict:
+            raise
         logger.warning("Kept the cached %s; it is in use (%s)", path.name, exc)
     except BaseException:
         temp.unlink(missing_ok=True)

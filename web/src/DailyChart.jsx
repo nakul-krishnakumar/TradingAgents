@@ -4,6 +4,7 @@ import {
 } from 'lightweight-charts';
 import { money } from './api';
 import { Help } from './Help';
+import { paperOrderLabel } from './DailyAutoTrade';
 
 const clock = new Intl.DateTimeFormat('en-IN', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 const formatTime = (time) => clock.format(time * 1000);
@@ -81,10 +82,11 @@ export function DailyChart({ bars, idea, symbol, day, orders }) {
     const entry = Number.isFinite(idea?.entry) ? markerTime(bars, idea.entry_at, false) : null;
     const exit = Number.isFinite(idea?.exit_price) ? markerTime(bars, idea.exit_at, idea.status !== 'time-exit') : null;
     const markers = orders.length ? orders.flatMap((order) => {
-      const time = order.bar_at ?? markerTime(bars, order.at, order.side === 'sell' && ['stop', 'target'].includes(order.reason));
+      const time = order.bar_at ?? markerTime(bars, order.at, order.net != null && ['stop', 'target'].includes(order.reason));
       if (!bars.some((bar) => bar.time === time)) return [];
-      return order.side === 'buy' ? [{ time, position: 'belowBar', color: '#08765e', shape: 'arrowUp', text: 'BUY', size: 1.35 }]
-        : [{ time, position: 'aboveBar', color: '#a83e42', shape: 'arrowDown', text: 'SELL', size: 1.35 }];
+      const text = paperOrderLabel(order);
+      return order.side === 'buy' ? [{ time, position: 'belowBar', color: '#08765e', shape: 'arrowUp', text, size: 1.35 }]
+        : [{ time, position: 'aboveBar', color: '#a83e42', shape: 'arrowDown', text, size: 1.35 }];
     }) : [
       ...(entry ? [{ time: entry, position: 'belowBar', color: '#08765e', shape: 'arrowUp', text: 'Example buy' }] : []),
       ...(exit ? [{ time: exit, position: 'aboveBar', color: '#ac4649', shape: 'arrowDown', text: 'Example sell' }] : []),
@@ -98,6 +100,6 @@ export function DailyChart({ bars, idea, symbol, day, orders }) {
       {[['open', 'Open'], ['high', 'High'], ['low', 'Low'], ['close', 'Close']].map(([field, label]) => <span key={field}>{label} <strong>{money(selected[field], 'INR')}</strong></span>)}
       <Help label="Five-minute prices" text="Open is the first price in this interval, high and low are its extremes, and close is the last price. Move over a different bar to see the figures for that time." />
     </div>}
-    <div className="daily-chart-canvas" ref={container} role="img" aria-label={`${symbol} prices and shares traded through the day${orders.length ? ' with paper BUY and SELL markers' : ''}`} />
+    <div className="daily-chart-canvas" ref={container} role="img" aria-label={`${symbol} prices and shares traded through the day${orders.length ? ' with paper order markers' : ''}`} />
   </>;
 }

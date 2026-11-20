@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 def launch(port: int, mode: str) -> int:
     from tradingagents.default_config import build_default_config
 
+    if mode == "local" and tunnel.connector_active(port):
+        mode = "tunnel"
     event(logger, "launcher.started", "Market Desk launcher started", mode=mode, port=port)
     with managed_bridge(build_default_config(), dashboard_port=port) as bridge_url:
         if bridge_url:

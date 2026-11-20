@@ -272,8 +272,17 @@ Open the HTTPS address printed by Cloudflare and sign in as `marketdesk` with
 the password from `.env`. Restart the launcher after changing the password.
 The launcher uses `cloudflared` from your PATH or downloads
 Cloudflare's binary into the ignored local environment on supported platforms.
-The free Quick Tunnel address is temporary and changes on restart. Keep the
-server and tunnel running while you need the address. [Cloudflare Quick Tunnels](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+The launcher keeps the Cloudflare connector running in the background. After
+stopping Market Desk, restart on the same port with `./run.sh --tunnel` or
+`./run.sh` to reuse its URL. The public route serves the dashboard once it
+starts again. Run `./run.sh --stop-tunnel` to turn off public access while
+leaving a running dashboard alone. Use the same `TRADINGAGENTS_PORT` if you
+started on a custom port.
+
+The first launch with this setup creates a new address. Cloudflare assigns
+another if the connector stops or the machine reboots. A Cloudflare named
+tunnel with a custom hostname is the option for a URL that survives connector
+restarts. [Cloudflare Tunnel fundamentals](https://developers.cloudflare.com/tunnel/concepts/)
 
 Open [Market Desk](http://127.0.0.1:8765) and search by Yahoo ticker, fund name, or
 AMFI scheme code. In **Research history**, open a run's **AI output and logs** for live chat
@@ -411,6 +420,9 @@ The ₹5,000 starting limit is editable for each IST date. Each idea is a separa
 cash-equity scenario. Its whole-share size fits the capital limit and a 0.65%
 estimated stop-loss budget including costs. The percentage shown is the estimated
 capital loss at the stop. The risk label describes the fractional stop distance.
+**Suggested paper capital** estimates the budget needed to fit one share in at
+least half the sampled stocks at the active trial's risk setting. Before setups
+form, it uses the prior NSE session's high–low ranges as a planning proxy.
 Manual **Run replay** compares the three rules on earlier available sessions
 for up to six names from the current watchlist, including estimated costs and
 separate counts for missing exit data.
@@ -420,15 +432,21 @@ trading sessions. All three strategies share the daily capital setting. The
 account fixes the amount at the first scan of each session. The scanner adds
 active and rotating NSE cash equities to its search, and keeps scanning stocks
 with open positions. It commits cash only to qualifying setups and carries any
-unused cash through the session. Stop auto trade cancels queued entries and
-keeps managing open positions until their exits.
+unused cash through the session. Pausing Auto Trade cancels queued entries and
+keeps managing open positions until their exits. Before starting a trial,
+choose a planned stop-loss budget per new position from 0.10% to 0.65% of
+daily paper capital, including modeled costs. Price gaps can exceed that estimate.
 
 Paper entries are submitted after confirmation and use the next eligible
 five-minute candle’s opening price inside the entry range. Results include
 modeled charges and slippage. The session history keeps the fills, strategy
 P&L, peak capital, skipped entries, and unresolved positions. The trial runs
 with public candles and advances while the server is up. Positions with missing
-exit prices remain visible for review.
+exit prices remain visible for review. A trial can opt into an opening-range
+breakdown short strategy for current NSE cash equities with an eligible stock
+derivatives listing. The simulator reserves the full position value and charges
+both legs. A missing interval leaves a short unresolved. Paper fills use candles
+and do not verify broker-specific shortability or order-book liquidity.
 
 Public candles support the watchlist, research charts and replay. For broker
 quote confirmation, add `UPSTOX_ANALYTICS_TOKEN` to `.env` and restart the server.

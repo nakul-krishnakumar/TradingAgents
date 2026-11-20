@@ -2,9 +2,11 @@ import json
 from datetime import datetime
 from decimal import Decimal
 
+import pytest
+
 from tradingagents.dashboard.daily_desk import _candidates
 from tradingagents.dashboard.daily_paper import AutoTradeSettings, DailyPaper
-from tradingagents.dashboard.daily_strategy import IST
+from tradingagents.dashboard.daily_strategy import IST, SHORT_STRATEGY
 
 DAY = "2026-11-19"
 
@@ -101,9 +103,92 @@ def test_enabling_mid_session_excludes_earlier_signals_and_skips_overshoots(tmp_
     assert session["orders"] == []
     assert session["skipped"] == {"Opening price outside entry range": 1}
     assert session["activity"][0]["skipped"] == [
-        {"symbol": "AAA.NS", "strategy": "opening-range", "reason": "Opening price outside entry range"}
+        {"symbol": "AAA.NS", "strategy": "opening-range", "reason": "Opening price outside entry range",
+         "opening_price": 100.2, "minimum_price": 99.8, "maximum_price": 100, "entry_at": timestamp("09:45")}
     ]
     assert session["activity"][-1]["signals"] == 0
+
+
+def short_signal(eligible=True):
+    assets, signals = assets_and_signals(["AAA.NS"])
+    assets[0]["short_eligible"] = eligible
+    signals[0].update(strategy=SHORT_STRATEGY, trigger=100, entry_cap=99.8, stop=100.6, target=97.5)
+    return assets, signals
+
+
+@pytest.mark.parametrize("enabled,eligible", [(False, True), (True, False)])
+def test_short_requires_trial_setting_and_eligibility(tmp_path, enabled, eligible):
+    account = DailyPaper(tmp_path / "auto.json")
+    assets, signals = short_signal(eligible)
+    account.configure(AutoTradeSettings(enabled=True, allow_shorts=enabled), when("09:00"))
+    account.advance(when("09:36"), "open", 5000, assets, {}, signals, True)
+    assert account.view(DAY)["session"]["queued"] == []
+
+
+@pytest.mark.parametrize("opening_price,high,reason,cover_price", [
+    (100.8, 101, "stop", 100.8),
+    (99.8, 100.2, "target", 97.5),
+])
+def test_short_is_collateralized_and_can_cover_after_pausing(tmp_path, opening_price, high, reason, cover_price):
+    path = tmp_path / "auto.json"
+    account = DailyPaper(path)
+    assets, signals = short_signal()
+    account.configure(AutoTradeSettings(enabled=True, allow_shorts=True, risk_bps=30), when("09:00"))
+    account.configure(AutoTradeSettings(enabled=True), when("09:01"))
+    account.advance(when("09:36"), "open", 5000, assets, {}, signals, True)
+    queued = account.view(DAY)["session"]["queued"][0]
+    assert (queued["direction"], queued["risk_bps"], queued["enter_at"]) == ("short", 30, timestamp("09:40"))
+    assert queued["quantity"] < 25
+    assert Decimal(queued["reserved"]) > Decimal(queued["quantity"]) * 100
+
+    opening = candle("09:40", opening=99.9, high=100.2, low=99.5, close=99.6)
+    account.advance(when("09:46"), "open", 5000, assets, {"AAA.NS": chart(opening)}, [], True)
+    state = account.view(DAY)["session"]
+    assert (state["open"], state["buys"], state["sells"], state["trades"]) == (1, 0, 1, 0)
+    assert Decimal(state["cash"]) + Decimal(state["invested"]) == 5000
+    assert "net" not in state["orders"][0]
+
+    account.configure(AutoTradeSettings(enabled=False), when("09:47"))
+    account = DailyPaper(path)
+    following = candle("09:45", opening=opening_price, high=high, low=97, close=99)
+    account.advance(when("09:51"), "open", 5000, assets, {"AAA.NS": chart(opening, following)}, [], False)
+    results = account.view(DAY)
+    state = results["session"]
+    cover, entry = state["orders"]
+    assert (cover["side"], cover["reason"], cover["price"]) == ("buy", reason, cover_price)
+    assert (state["open"], state["buys"], state["sells"], state["trades"]) == (0, 1, 1, 1)
+    expected = (Decimal("99.9") - Decimal(str(cover_price))) * entry["units"]
+    expected -= Decimal(entry["fee"]) + Decimal(cover["fee"])
+    assert Decimal(state["realized"]) == Decimal(cover["net"]) == expected
+    assert Decimal(state["cash"]) == 5000 + expected
+    assert results["totals"]["trades"] == 1
+
+
+def test_short_with_a_missing_interval_stays_unresolved(tmp_path):
+    account = DailyPaper(tmp_path / "auto.json")
+    assets, signals = short_signal()
+    account.configure(AutoTradeSettings(enabled=True, allow_shorts=True), when("09:00"))
+    account.advance(when("09:36"), "open", 5000, assets, {}, signals, True)
+    opening = candle("09:40", opening=99.9, high=100.2, low=99.5, close=99.6)
+    after_gap = candle("09:50", opening=97, high=97.1, low=96.8, close=97)
+    account.advance(when("09:46"), "open", 5000, assets, {"AAA.NS": chart(opening)}, [], True)
+    account.advance(when("15:31"), "after-hours", 5000, assets, {"AAA.NS": chart(opening, after_gap)}, [], False)
+    state = account.view(DAY)["session"]
+    assert (state["sells"], state["buys"], state["unresolved"], state["trades"]) == (1, 0, 1, 0)
+    assert state["holdings"][0]["data_gap"]
+
+
+def test_risk_slider_sizes_the_same_long_signal(tmp_path):
+    assets, signals = assets_and_signals(["AAA.NS"])
+    quantities = []
+    for bps in (10, 65):
+        account = DailyPaper(tmp_path / f"auto-{bps}.json")
+        account.configure(AutoTradeSettings(enabled=True, risk_bps=bps), when("09:00"))
+        account.advance(when("09:36"), "open", 5000, assets, {}, signals, True)
+        state = account.view(DAY)["session"]
+        assert state["activity"][0]["signals"] == 1
+        quantities.append(state["queued"][0]["quantity"])
+    assert 0 < quantities[0] < quantities[1]
 
 
 def test_stopping_preserves_positions_and_their_exit_rules(tmp_path):

@@ -23,8 +23,10 @@ import random
 import re
 import time
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
+from threading import Lock
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -100,6 +102,9 @@ _SCREEN_CHARS = 1000   # of a post's title and body sent for screening
 
 
 _SEARCH_LOOKBACK = timedelta(days=7)  # matches t=week below
+_NOT_FOUND_COOLDOWN = 300
+_not_found_until: OrderedDict[str, float] = OrderedDict()
+_not_found_lock = Lock()
 
 
 def _search_qs(ticker: str, limit: int) -> str:
@@ -201,11 +206,23 @@ def _fetch_subreddit_rss(
     discussion that was never observed (#1295).
     """
     url = _RSS.format(sub=sub, qs=_search_qs(ticker, limit))
+    with _not_found_lock:
+        if _not_found_until.get(url, 0) > time.monotonic():
+            return None
     req = Request(url, headers={"User-Agent": _UA})
     try:
         with urlopen(req, timeout=timeout) as resp:
             root = ET.fromstring(_read_capped(resp))
     except HTTPError as exc:
+        if exc.code == 404:
+            with _not_found_lock:
+                now = time.monotonic()
+                if _not_found_until.get(url, 0) > now:
+                    return None
+                _not_found_until[url] = now + _NOT_FOUND_COOLDOWN
+                _not_found_until.move_to_end(url)
+                if len(_not_found_until) > 128:
+                    _not_found_until.popitem(last=False)
         if exc.code == 429 and _retry:
             # Honour a server-supplied Retry-After exactly (including 0); jitter
             # only our own fallback so concurrent runs don't retry in lockstep.
@@ -277,11 +294,18 @@ def fetch_reddit_posts(
     # ("BTC") so the query actually matches discussion instead of near-nothing.
     ticker = crypto_base(ticker) or ticker
     label = ", ".join(f"r/{s}" for s in subreddits)
+    window = bool(start_date and end_date)
+    if window:
+        oldest_day = (datetime.now(UTC) - _SEARCH_LOOKBACK).date()
+        if datetime.strptime(end_date, "%Y-%m-%d").date() < oldest_day:
+            return (
+                f"<Reddit unavailable: {start_date}..{end_date} predates "
+                "the 7-day search window; this is not an absence of discussion>"
+            )
     fetched = _fetch_subreddit_rss(ticker, "+".join(subreddits), _FEED_PAGE, timeout)
     if fetched is None:
         return f"<Reddit unavailable: fetch failed ({label}); this is not an absence of discussion>"
 
-    window = bool(start_date and end_date)
     posts = _within_window(fetched, start_date, end_date)
     if not posts:
         gap = window and coverage_gap(

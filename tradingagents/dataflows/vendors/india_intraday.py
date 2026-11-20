@@ -197,12 +197,30 @@ def _yahoo_candles(symbol: str, start: date, end: date) -> list[dict]:
 
 
 @lru_cache(maxsize=192)
-def history(symbol: str, day: str, period: str = "10d") -> list[dict]:
-    """Fetch a day-cached Yahoo 5-minute lookback for prior-session calculations."""
+def history(symbol: str, day: str, period: str = "10d", isin: str = "") -> list[dict]:
+    """Fetch completed-session 5-minute history, preferring authenticated Upstox."""
     if not re.fullmatch(r"[1-9]\d?d", period) or int(period[:-1]) > 59:
-        raise ValueError("Choose a Yahoo lookback from 1 to 59 days.")
+        raise ValueError("Choose an intraday lookback from 1 to 59 days.")
     end = date.fromisoformat(day)
     start = end - timedelta(days=int(period[:-1]) - 1)
+    token = _upstox_token()
+    if token and _ISIN.fullmatch(isin):
+        reference = quote(f"NSE_EQ|{isin}", safe="")
+        bars = []
+        first = start
+        try:
+            while first <= end:
+                # Upstox limits five-minute requests to one month per call.
+                last = min(first + timedelta(days=27), end)
+                url = f"{_UPSTOX}/v3/historical-candle/{reference}/minutes/5/{last}/{first}"
+                response = _get(url, token=token)
+                bars.extend(_clean_candles(response["data"]["candles"], first, last))
+                first = last + timedelta(days=1)
+            if bars:
+                return bars
+        except (OSError, ValueError, AttributeError, KeyError, TypeError) as exc:
+            event(logger, "market_data.history_fallback", "Upstox history failed. Using Yahoo Finance.",
+                  level=logging.WARNING, symbol=symbol, date=day, **exception_fields(exc))
     return _yahoo_candles(symbol, start, end)
 
 

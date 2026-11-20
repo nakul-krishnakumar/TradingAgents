@@ -7,7 +7,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from openai import OpenAI
+from openai import APIError, OpenAI
 from pydantic import BaseModel
 
 from tradingagents.dashboard.codex_bridge import ChatRequest, CodexExec, create_app
@@ -18,6 +18,7 @@ from tradingagents.llm_clients.codex_config import (
     DEFAULT_MODEL,
     KEY_ENV,
     bridge_models,
+    bridge_timeout,
 )
 from tradingagents.llm_clients.factory import create_tier_client
 
@@ -47,6 +48,13 @@ def test_bridge_models_accepts_existing_single_model_configuration(monkeypatch):
 
     monkeypatch.setenv("TRADINGAGENTS_CODEX_MODELS", "gpt-6.2-astra, gpt-6.2-sol, gpt-6.2-sol")
     assert bridge_models() == ("gpt-6.2-astra", "gpt-6.2-sol")
+
+
+def test_codex_timeout_default_and_override(monkeypatch):
+    monkeypatch.delenv("TRADINGAGENTS_CODEX_TIMEOUT", raising=False)
+    assert bridge_timeout() == 600
+    monkeypatch.setenv("TRADINGAGENTS_CODEX_TIMEOUT", "240")
+    assert bridge_timeout() == 240
 
 
 @pytest.fixture
@@ -140,7 +148,6 @@ def test_codex_provider_usage_and_summary_reach_model_log(bridge, monkeypatch, t
     assert events[-1]["usage"] == {"input": 100, "output": 12, "thinking": 4}
 
 
-
 def test_bridge_call_can_be_followed_by_original_run_and_model_call_ids(bridge, monkeypatch, tmp_path):
     backend, http = bridge
     monkeypatch.setenv(KEY_ENV, backend.key)
@@ -163,3 +170,29 @@ def test_bridge_call_can_be_followed_by_original_run_and_model_call_ids(bridge, 
     call = read_model_log(trace.path, 0)["events"][0]["call"]
     events = read_events(handler.path, trace=run)["events"]
     assert any(entry["event"] == "codex.completed" and entry["fields"]["call_id"] == call for entry in events)
+
+
+def test_streamed_codex_timeout_reaches_model_log(bridge, monkeypatch, tmp_path):
+    backend, http = bridge
+    monkeypatch.setenv(KEY_ENV, backend.key)
+    monkeypatch.setenv("TRADINGAGENTS_CODEX_TIMEOUT", "0.01")
+    codex = CodexExec()
+
+    async def stall(_command, _folder, _prompt, summaries):
+        summaries.put_nowait("Considering the evidence.")
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(codex, "_run", stall)
+    monkeypatch.setattr(backend, "generate", codex.generate)
+    model = backend.models[1]
+    config = {"llm_provider": "codex", "deep_think_llm": model, "stream_model_output": True}
+    client = create_tier_client(config, "deep", http_client=http).get_llm()
+    callback = ModelLog(tmp_path / "model_log.jsonl", {"deep": {"provider": "codex", "model": model}})
+
+    with pytest.raises(APIError, match="Codex exceeded the bridge timeout"):
+        client.invoke("Summarize the evidence", config={"callbacks": [callback]})
+
+    events = read_model_log(callback.path, 0)["events"]
+    assert events[-2]["channel"] == "summary"
+    assert events[-1]["type"] == "error"
+    assert events[-1]["detail"] == "Codex exceeded the bridge timeout."

@@ -29,14 +29,24 @@ trap 'log_setup_exit "$?"' EXIT
 
 if [[ $# -eq 1 && "$1" == --tunnel ]]; then
   mode=tunnel
+elif [[ $# -eq 1 && "$1" == --stop-tunnel ]]; then
+  mode=stop-tunnel
 elif [[ $# -ne 0 ]]; then
-  printf '%s\n' 'Usage: ./run.sh [--tunnel]' >&2
+  printf '%s\n' 'Usage: ./run.sh [--tunnel | --stop-tunnel]' >&2
   exit 2
 fi
 
 if [[ ! "$port" =~ ^[1-9][0-9]{0,4}$ ]] || (( port > 65535 )); then
   printf '%s\n' 'TRADINGAGENTS_PORT must be a port from 1 to 65535.' >&2
   exit 2
+fi
+
+if [[ "$mode" == stop-tunnel ]]; then
+  if [[ -x .venv/bin/python ]]; then
+    exec .venv/bin/python -m tradingagents.dashboard.tunnel "$port" --stop
+  fi
+  printf '%s\n' 'No Market Desk tunnel is running.'
+  exit 0
 fi
 
 startup_stage=python_environment

@@ -5,7 +5,7 @@ import {
 } from 'lucide-react';
 import { api, dateLabel, makeUrl, money, number, signed, signedMoney, todayIST, tone } from './api';
 import { DailyChart } from './DailyChart';
-import { DailyAutoTrade, paperStrategies } from './DailyAutoTrade';
+import { DailyAutoTrade, paperOrderLabel, paperStrategies } from './DailyAutoTrade';
 import { Help, HelpDetails, HelpTitle, WithHelp } from './Help';
 import ModelLog from './ModelLog';
 import './daily.css';
@@ -103,6 +103,7 @@ function SessionControls({ data, day, setDay, today, run, runningAction, saveBud
   const schedulerText = archive ? 'Saved market data' : !data ? 'Checking schedule' : data.operation === 'replay' ? 'Testing strategies'
     : working ? 'Checking the market' : data.scheduled ? 'Automatic checks on' : 'Automatic checks off';
   const paperSession = data?.auto_trade?.session;
+  const capital = data?.suggested_capital;
 
   async function submit(event) {
     event.preventDefault();
@@ -142,6 +143,17 @@ function SessionControls({ data, day, setDay, today, run, runningAction, saveBud
         </WithHelp>
       </div>
     </div>
+    {!archive && (capital || data?.phase === 'premarket') && <aside className="daily-capital" aria-labelledby="daily-capital-title">
+      <div>
+        <WithHelp label="Suggested paper capital"
+          text="Estimates the paper capital needed for one share in at least half the sampled stocks, including modeled costs. It uses the active trial’s risk limit or the 0.65% default. The premarket estimate uses the prior NSE session’s high–low range as a planning proxy.">
+          <h3 id="daily-capital-title">Suggested paper capital</h3>
+        </WithHelp>
+        {capital ? <p>{capital.basis === 'setups' ? 'Fresh long setup plans' : 'NSE prior-session ranges'} · Fits one share in {capital.affordable} of {capital.sample} stocks at {(capital.risk_bps / 100).toFixed(2)}% modeled risk</p>
+          : <p>Waiting for usable NSE watchlist prices.</p>}
+      </div>
+      {capital && <strong>{rupees(capital.amount)}</strong>}
+    </aside>}
     {paperSession && !archive && Number(paperSession.budget) !== data.budget && <p className="daily-session-note">Auto Trade is using {rupees(paperSession.budget)}, the limit when today’s practice account started.</p>}
     {feed && <HelpDetails className="daily-feed-line" wrapperClassName="daily-feed-help" label="Price data sources"
       summary={<><Radio size={14} /> Price data from {feed.name || 'market providers'}</>}
@@ -229,14 +241,17 @@ function IdeaList({ ideas, candidates, selection, setSelection, loading }) {
 
 function ChartPanel({ panelRef, chart, chartError, candidate, day, idea, symbol, onResearch, orders }) {
   const recent = chart?.bars?.at(-1);
-  const quote = candidate?.last ?? recent?.close ?? candidate?.preopen_price ?? candidate?.prior_close;
-  const caption = candidate?.last != null || recent ? 'Last price available' : candidate?.preopen_price != null ? 'Estimated opening price' : 'Previous day’s closing price';
-  const observed = candidate?.last != null ? candidate.as_of : chart?.as_of ?? candidate?.preopen_at;
+  const candleAt = candidate?.last != null ? candidate.as_of : chart?.as_of;
+  const broker = candidate?.live_quote;
+  const useBroker = broker?.last != null && broker.last_trade_at >= (candleAt ?? 0);
+  const quote = useBroker ? broker.last : candidate?.last ?? recent?.close ?? candidate?.preopen_price ?? candidate?.prior_close;
+  const caption = useBroker ? 'Upstox last trade' : candidate?.last != null || recent ? 'Latest 5-minute close' : candidate?.preopen_price != null ? 'Estimated opening price' : 'Previous day’s closing price';
+  const observed = useBroker ? broker.last_trade_at : candleAt ?? candidate?.preopen_at;
   const name = candidate?.name || idea?.name;
 
   return <section className="panel daily-chart-panel" ref={panelRef} tabIndex={-1} aria-label="Stock price chart and buy or sell plan">
     <div className="daily-chart-heading">
-      <div><HelpTitle label="Stock price chart" text="See how the selected stock moved through the trading day in five-minute intervals. Move over a bar to read its prices. BUY and SELL markers show completed paper trades when available. Dashed lines show levels for an example trade plan.">
+      <div><HelpTitle label="Stock price chart" text="See five-minute prices and paper order markers. SHORT opens a short position and COVER buys it back. Dashed lines show levels for an example trade plan.">
         {symbol?.replace(/\.NS$/, '') || 'Stock price chart'}
       </HelpTitle>{symbol && <p>{name || 'NSE stock'}{idea && ` · ${paperStrategies[idea.strategy]?.label || idea.label}`}</p>}</div>
       {symbol && <div className="daily-quote"><strong>{rupees(quote)}</strong><small>{caption}{observed && ` · ${timeLabel(observed)}`}</small>
@@ -253,7 +268,7 @@ function ChartPanel({ panelRef, chart, chartError, candidate, day, idea, symbol,
       </div>}
     </div>}
     {orders.length > 0 && <div className="daily-chart-trades" aria-label="Paper trades on this chart">
-      {orders.map((order) => <span key={`${order.at}:${order.side}`}><strong className={`trade-side trade-side-${order.side}`}>{order.side.toUpperCase()}</strong> {order.units} × {rupees(order.price)} · {timeLabel(order.at)}</span>)}
+      {orders.map((order) => <span key={`${order.at}:${order.side}`}><strong className={`trade-side trade-side-${order.side}`}>{paperOrderLabel(order)}</strong> {order.units} × {rupees(order.price)} · {timeLabel(order.at)}</span>)}
     </div>}
     {idea && <TradePlan idea={idea} />}
   </section>;
@@ -353,6 +368,7 @@ function ReplayPanel({ replay, available, pending, onRun }) {
     </div>
     {replay ? <div className="daily-replay-content">
       <p>{number(asNumber(replay.sessions), 0)} stock-and-day tests through {dateLabel(replay.through)} · {rupees(replay.budget)} limit</p>
+      {replay.incomplete_sessions > 0 && <p>{replay.incomplete_sessions} stock-and-day samples skipped due to incomplete candles or opening volume.</p>}
       {replay.symbols?.length > 0 && <p>{replay.symbols.join(' · ')}</p>}
       <div className="table-scroll"><table><thead><tr>{[
         ['Strategy', 'The price pattern that generated the example trades in this row.'],
@@ -422,8 +438,8 @@ export function DailyTrading({ onResearch, onDiagnostics }) {
     {feedback && <p className="daily-feedback" role="status">{feedback}</p>}
     <DailyAutoTrade data={data} archive={Boolean(day)} busy={Boolean(action)} timeLabel={timeLabel} onDay={chooseDay} onChart={showTradeChart}
       onDiagnostics={onDiagnostics}
-      onChange={(enabled, sessions) => perform('auto', '/api/daily/auto-trade', { enabled, sessions },
-        enabled ? 'Auto Trade is scheduled for the next market check.' : 'New buys are paused. Shares already held still follow their sell rules.')} />
+      onChange={(settings) => perform('auto', '/api/daily/auto-trade', settings,
+        settings.enabled ? 'Auto Trade is scheduled for the next market check.' : 'New entries are paused. Auto Trade will keep managing open positions.')} />
     {data?.warnings?.length > 0 && <HelpDetails className="daily-warnings" wrapperClassName="daily-warnings-help"
       label="Market data notices" summary={`Market data notices (${data.warnings.length})`}
       text="Open to see which prices or sources were delayed, missing, or could not be checked. This helps explain gaps in the watchlist, chart, or trade decisions.">

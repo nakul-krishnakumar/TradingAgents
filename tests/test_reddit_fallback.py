@@ -90,6 +90,21 @@ class TestRssParsing:
 
 
 @pytest.mark.unit
+def test_repeated_404_is_skipped_until_cooldown_expires(monkeypatch):
+    clock = 1000
+    monkeypatch.setattr(reddit.time, "monotonic", lambda: clock)
+    monkeypatch.setattr(reddit, "_not_found_until", reddit.OrderedDict())
+    err = HTTPError("url", 404, "Not Found", {}, None)
+    with patch.object(reddit, "urlopen", side_effect=[err, _atom_resp()]) as request:
+        assert "Reddit unavailable" in reddit.fetch_reddit_posts("SBIN.NS")
+        assert "Reddit unavailable" in reddit.fetch_reddit_posts("SBIN.NS")
+        assert request.call_count == 1
+        clock += reddit._NOT_FOUND_COOLDOWN
+        assert "Reddit unavailable" not in reddit.fetch_reddit_posts("SBIN.NS")
+        assert request.call_count == 2
+
+
+@pytest.mark.unit
 class TestRss429Backoff:
     def test_429_then_success_retries_once(self):
         err = HTTPError("url", 429, "Too Many Requests", {}, None)

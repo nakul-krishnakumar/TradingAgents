@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
@@ -32,13 +33,17 @@ from .daily_paper import DailyPaper
 from .daily_strategy import (
     BAR_SECONDS,
     CLOSE,
+    DEFAULT_RISK_BPS,
     ENTRY_CUTOFF,
     IST,
     LAST_CONTINUOUS_BAR,
     OPEN,
+    STRATEGIES,
     Candle,
+    cash_costs,
     evaluate,
     indicators,
+    leg_cost,
     position_size,
 )
 from .market import DEFAULTS
@@ -136,6 +141,13 @@ def _candidates(master, previous, active, preopen, retained, now, include_active
     tracked = tracked or {}
     by_symbol = {item["SYMBOL"]: item for item in master if item.get("SYMBOL") and item.get("SERIES", "EQ") == "EQ"}
     previous_day, data = previous
+    if not master:
+        by_symbol = {
+            item["TckrSymb"]: {"NAME OF COMPANY": item.get("FinInstrmNm")}
+            for item in data
+            if item.get("TckrSymb") and item.get("SctySrs") == "EQ"
+            and (item.get("ISIN") or "").startswith("INE")
+        }
     prior = {item["TckrSymb"]: item for item in data
              if item.get("TckrSymb") in by_symbol and item.get("SctySrs") == "EQ"
              and _number(item.get("ClsPric")) >= (0.01 if paper else 50)}
@@ -176,17 +188,50 @@ def _candidates(master, previous, active, preopen, retained, now, include_active
         meta, old, active_quote = by_symbol.get(symbol, {}), prior.get(symbol, {}), active_by_symbol.get(symbol, {})
         tracked_asset = tracked.get(f"{symbol}.NS", {})
         price, prev = _num(old.get("ClsPric")), _num(old.get("PrvsClsgPric"))
+        high, low = _num(old.get("HghPric")), _num(old.get("LwPric"))
         output.append({
             "symbol": f"{symbol}.NS",
             "name": meta.get("NAME OF COMPANY") or tracked_asset.get("name") or fallback_names.get(symbol, symbol),
             "isin": meta.get("ISIN NUMBER") or old.get("ISIN") or tracked_asset.get("isin"), "prior_close": price,
             "prior_change": round((price / prev - 1) * 100, 2) if price and prev else None,
+            "prior_range_fraction": (high - low) / price if price and price > 0 and high and low and 0 < low < high else None,
             "turnover": _num(active_quote.get("totalTradedValuecsv")) or _num(old.get("TtlTrfVal")),
             "turnover_source": "NSE intraday turnover" if active_quote else "NSE prior-session turnover",
             "prior_session": previous_day, "last": None, "as_of": None, "feed": None, "fresh": False,
             **indicative.get(symbol, {}),
         })
     return output
+
+
+def _suggested_capital(candidates, ideas, risk_bps):
+    """Estimate enough capital to fund one share in at least half the sampled stocks."""
+    risk_fraction = risk_bps / 10_000
+
+    def required(entry, stop):
+        return max(entry * 1.002, entry + leg_cost("buy", entry),
+                   (entry - stop + cash_costs(entry, stop, 1)) / risk_fraction)
+
+    requirements = {}
+    for idea in ideas:
+        if (idea["fresh"] and idea["status"] in {"watch", "confirmed"}
+                and (idea.get("size") or {}).get("reward_risk", 0) >= 1.5):
+            amount = required(idea["entry_cap"], idea["stop"])
+            symbol = idea["symbol"]
+            requirements[symbol] = min(requirements.get(symbol, amount), amount)
+    basis = "setups"
+    if not requirements:
+        basis = "prior-range"
+        for row in candidates:
+            fraction = row.get("prior_range_fraction")
+            price = (row.get("last") if row["fresh"] else row.get("preopen_price")) or row.get("prior_close")
+            if price and price > 0 and fraction and 0 < fraction < 1 and not row.get("corporate_action"):
+                requirements[row["symbol"]] = required(price, price * (1 - fraction))
+    if not requirements:
+        return None
+    values = sorted(requirements.values())
+    amount = math.ceil(values[(len(values) - 1) // 2] / 100) * 100
+    return {"amount": amount, "risk_bps": risk_bps, "basis": basis,
+            "sample": len(values), "affordable": sum(value <= amount for value in values)}
 
 
 def _evidence(filings, candidates, decision_time):
@@ -218,7 +263,8 @@ def _scan_asset(asset, day, now, open_for_signals, budget):
     returned, source, mode = provider.intraday(asset["symbol"], asset.get("isin") or "", day)
     today = _day_bars(returned, day, int(now.timestamp()))
     try:
-        prior_data = provider.history(asset["symbol"], day)
+        through = (now.date() - timedelta(days=1)).isoformat()
+        prior_data = provider.history(asset["symbol"], through, "9d", asset.get("isin") or "")
     except (OSError, RuntimeError, ValueError, VendorError) as exc:
         event(logger, "daily.price_history_failed", "Earlier prices were unavailable for strategy comparison",
               level=logging.WARNING, symbol=asset["symbol"], date=day, **exception_fields(exc))
@@ -229,9 +275,12 @@ def _scan_asset(asset, day, now, open_for_signals, budget):
     prior = _prior_bars(prior_data, day)
     strategy_bars = [bar for bar in today if bar.local.time() < LAST_CONTINUOUS_BAR and bar.volume > 0]
     prior_close = None if asset.get("corporate_action") else asset.get("prior_close")
-    ideas, _ = evaluate(prior, strategy_bars, prior_close, budget)
+    ideas, features = evaluate(prior, strategy_bars, prior_close, budget,
+                               allow_shorts=asset.get("short_eligible", False))
+    if len(strategy_bars) != len(today):
+        features = indicators(prior, today)
     prepared = [{**asdict(bar), "vwap": round(feature["vwap"], 4)}
-                for bar, feature in zip(today, indicators(prior, today), strict=True)]
+                for bar, feature in zip(today, features, strict=True)]
     source_ready = bool(open_for_signals and fresh and mode == "authenticated" and now.time() < ENTRY_CUTOFF)
     updated = {**asset, "last": today[-1].close if today else None, "as_of": as_of,
                "feed": source, "fresh": fresh, "mode": mode}
@@ -454,7 +503,9 @@ class DailyDesk:
                   level=logging.WARNING, **exception_fields(exc))
         bucket = int(now.timestamp() // BAR_SECONDS)
         prior_day = (now.date() - timedelta(days=1)).isoformat()
-        with ThreadPoolExecutor(max_workers=5) as pool:
+        paper_active, tracking, _ = self.paper.inputs(day, now.time())
+        check_shorts = phase == "open" and paper_active and self.paper.short_entries_enabled()
+        with ThreadPoolExecutor(max_workers=6 if check_shorts else 5) as pool:
             pending = {
                 "NSE security master": (submit_traced(pool, nse.securities, "stock", day), ()),
                 "Prior NSE session": (submit_traced(pool, nse.last_bhavcopy, prior_day), ("", ())),
@@ -465,21 +516,34 @@ class DailyDesk:
                 pending["NSE activity"] = (submit_traced(pool, provider.active_equities, bucket), {})
             if phase == "open":
                 pending["NSE market status"] = (submit_traced(pool, provider.market_status, bucket), {})
+            if check_shorts:
+                pending["NSE short eligibility"] = (submit_traced(pool, nse.short_eligible_symbols, day), frozenset())
             pending["NSE disclosures"] = (submit_traced(pool, provider.disclosures, day), [])
             pending["NSE corporate actions"] = (submit_traced(pool, provider.corporate_actions, day, bucket // 3), [])
             data = {name: _load(task, fallback, name, warnings) for name, (task, fallback) in pending.items()}
 
         retained = [idea["symbol"].removesuffix(".NS") for idea in current.get("ideas", [])
                     if idea["status"] in {"confirmed", "open"}]
-        paper_active, tracking, _ = self.paper.inputs(day, now.time())
+        if not data["NSE security master"] and data["Prior NSE session"][1]:
+            warnings.append("Using the prior NSE session's cash equity list for stock selection.")
         candidates = _candidates(data["NSE security master"], data["Prior NSE session"], data.get("NSE activity", {}),
                                  data.get("NSE pre-open auction", {}), retained, now, phase != "premarket",
                                  paper=paper_active and phase == "open", tracked=tracking)
         actions = {f"{item['symbol']}.NS": item.get("subject", "Corporate action") for item in data["NSE corporate actions"]
                    if item.get("symbol") and (ex := _stamp(item.get("exDate"))) and ex.date() == now.date()}
+        cash_equities = {row["SYMBOL"] for row in data["NSE security master"]
+                         if row.get("SYMBOL") and row.get("SERIES") == "EQ"} if check_shorts else set()
+        short_symbols = cash_equities & data.get("NSE short eligibility", frozenset())
+        if check_shorts and not cash_equities:
+            warnings.append("New paper shorts need the current NSE cash-equity list.")
         for row in candidates:
             if row["symbol"] in actions:
                 row["corporate_action"] = actions[row["symbol"]]
+            if check_shorts:
+                row["short_eligible"] = (
+                    (row.get("isin") or "").startswith("INE")
+                    and row["symbol"].removesuffix(".NS") in short_symbols
+                )
         venue = next((item for item in data.get("NSE market status", {}).get("marketState", [])
                       if item.get("market") == "Capital Market"), {})
         market_date = _stamp(venue.get("tradeDate"))
@@ -538,10 +602,11 @@ class DailyDesk:
             for symbol, chart in current.get("charts", {}).items():
                 if symbol in traded:
                     charts.setdefault(symbol, chart)
+        visible_ideas = [idea for idea in ideas if idea["strategy"] in STRATEGIES]
         self._save(self.path(day, "scan.json"), {
             "day": day, "slot": slot, "updated_at": now.isoformat(), "brief": brief, "session": self.session,
             "completed_at": observed_at.isoformat(), "scan_id": trace_context().get("scan_id"),
-            "candidates": scanned or candidates, "ideas": ideas, "charts": charts, "warnings": warnings,
+            "candidates": scanned or candidates, "ideas": visible_ideas, "charts": charts, "warnings": warnings,
             "latest_filings": recent_filings,
             "feed": {"name": " · ".join(feeds) or "NSE session data", "mode": "broker" if broker else "reference",
                      "note": "Entry indications also check the current ask, spread, available size, and NSE session." if broker else
@@ -577,11 +642,15 @@ class DailyDesk:
             age = int(now.timestamp()) - (row.get("as_of") or 0)
             candidates.append({**row, "fresh": day == today and phase == "open" and 0 <= age <= 2 * BAR_SECONDS})
         paper = self.paper.view(day)
+        trial = paper["trial"] or {}
+        risk_bps = trial.get("risk_bps", DEFAULT_RISK_BPS) if trial.get("enabled") else DEFAULT_RISK_BPS
+        capital = (_suggested_capital(candidates, ideas, risk_bps)
+                   if day == today and phase in {"premarket", "open"} and now.time() < ENTRY_CUTOFF else None)
         dates = {path.parent.name for path in self.root.glob("*/scan.json")}
         dates.update(item["day"] for item in paper["history"])
         return {
             **{key: value for key, value in snapshot.items() if key != "charts"},
-            "day": day, "budget": budget, "phase": phase, "scheduled": self.enabled,
+            "day": day, "budget": budget, "suggested_capital": capital, "phase": phase, "scheduled": self.enabled,
             "next_scan": next_scan.isoformat() if next_scan else None, "running": self.running,
             "operation": (self.operation or self.request) if day == today else None,
             "active_scan_id": self.scan_id if day == today else None,

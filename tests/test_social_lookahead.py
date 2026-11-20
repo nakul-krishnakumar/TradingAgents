@@ -99,9 +99,20 @@ def _epoch(date_str):
     return int(datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=UTC).timestamp())
 
 
+@pytest.fixture
+def reddit_may_window(monkeypatch):
+    class MayClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 5, 8, 12, tzinfo=tz)
+
+    monkeypatch.setattr(reddit, "datetime", MayClock)
+
+
 @pytest.mark.unit
-def test_reddit_historical_window_excludes_recent(monkeypatch):
-    posts = [{"title": "NOW", "created_utc": _epoch("2026-08-30"), "source": "rss"}]
+def test_reddit_historical_window_excludes_recent(monkeypatch, reddit_may_window):
+    posts = [{"title": "NOW", "created_utc": _epoch("2026-08-30"), "source": "rss"}
+             for _ in range(reddit._FEED_PAGE)]
     monkeypatch.setattr(reddit, "_fetch_subreddit_rss", lambda *a, **k: posts)
     out = reddit.fetch_reddit_posts(
         "AAPL", subreddits=("stocks",),
@@ -112,7 +123,7 @@ def test_reddit_historical_window_excludes_recent(monkeypatch):
 
 
 @pytest.mark.unit
-def test_reddit_live_window_keeps_in_range(monkeypatch):
+def test_reddit_live_window_keeps_in_range(monkeypatch, reddit_may_window):
     posts = [{"title": "INRANGE", "created_utc": _epoch("2026-05-05"), "source": "rss"}]
     monkeypatch.setattr(reddit, "_fetch_subreddit_rss", lambda *a, **k: posts)
     out = reddit.fetch_reddit_posts(
@@ -139,7 +150,7 @@ def test_stocktwits_covered_but_empty_window_is_a_real_absence(monkeypatch):
 
 
 @pytest.mark.unit
-def test_reddit_covered_but_empty_window_is_a_real_absence(monkeypatch):
+def test_reddit_covered_but_empty_window_is_a_real_absence(monkeypatch, reddit_may_window):
     posts = [{"title": "NOW", "created_utc": _epoch("2026-08-30"), "source": "rss"},
              {"title": "OLD", "created_utc": _epoch("2026-04-20"), "source": "rss"}]
     monkeypatch.setattr(reddit, "_fetch_subreddit_rss", lambda *a, **k: posts)
@@ -152,11 +163,11 @@ def test_reddit_covered_but_empty_window_is_a_real_absence(monkeypatch):
 
 
 @pytest.mark.unit
-def test_reddit_empty_feed_for_an_old_window_is_unavailable(monkeypatch):
-    # Search is limited to the last week, so an empty response says nothing
-    # about a window from months ago: there are no timestamps to go on, and the
-    # lookback bound alone must decide.
-    monkeypatch.setattr(reddit, "_fetch_subreddit_rss", lambda *a, **k: [])
+def test_reddit_old_window_is_unavailable_without_a_fetch(monkeypatch):
+    def unexpected_fetch(*args, **kwargs):
+        pytest.fail("An old window should not fetch the recent Reddit feed")
+
+    monkeypatch.setattr(reddit, "_fetch_subreddit_rss", unexpected_fetch)
     out = reddit.fetch_reddit_posts(
         "AAPL", subreddits=("stocks",),
         start_date="2024-05-01", end_date="2024-05-08",

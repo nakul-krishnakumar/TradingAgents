@@ -46,6 +46,24 @@ def securities(group: str, day: str) -> tuple[dict, ...]:
 
 
 @lru_cache(maxsize=4)
+def short_eligible_symbols(day: str) -> frozenset[str]:
+    """Read the current NSE equity-derivatives list for this session's paper shorts."""
+    response = _get("https://nsearchives.nseindia.com/content/fo/fo_mktlots.csv")
+    rows = iter(_rows(response.content.decode("utf-8-sig", errors="replace")))
+    for row in rows:
+        if row.get("UNDERLYING") == "Derivatives on Individual Securities":
+            break
+    symbols = set()
+    for row in rows:
+        nearest_lot = next((value for key, value in row.items() if key not in {"UNDERLYING", "SYMBOL"}), "")
+        if row.get("SYMBOL") and nearest_lot.isdecimal() and int(nearest_lot) > 0:
+            symbols.add(row["SYMBOL"])
+    if not symbols:
+        raise ValueError("NSE returned an empty equity-derivatives list.")
+    return frozenset(symbols)
+
+
+@lru_cache(maxsize=4)
 def industries(day: str) -> dict[str, str]:
     url = "https://www.niftyindices.com/IndexConstituent/ind_nifty500list.csv"
     return {row["Symbol"]: row["Industry"] for row in _rows(_get(url).text)

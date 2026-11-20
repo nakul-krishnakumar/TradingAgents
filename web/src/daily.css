@@ -19,6 +19,10 @@
 .daily-budget-input input { width: 91px; height: 31px; min-width: 0; padding: 4px; border: 0; border-radius: 5px; background: transparent; color: inherit; font-size: .88rem; font-variant-numeric: tabular-nums; }
 .daily-budget-input button { padding: 5px 7px; color: #0d603f; background: #e7f3eb; border: 1px solid #d3e8da; border-radius: 5px; font-size: .74rem; font-weight: 630; }
 .daily-budget-input button:not(:disabled):hover { background: #cdebd9; }
+.daily-capital { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px 16px; padding: 11px 13px; border: 1px solid #d4e9de; border-radius: 8px; background: #eef7f2; }
+.daily-capital h3 { color: #1b4737; font-size: .82rem; font-weight: 650; }
+.daily-capital p { color: var(--subtle); font-size: .77rem; line-height: 1.45; }
+.daily-capital > strong { color: #1b4737; font-size: 1.26rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .daily-session-date { gap: 5px; padding-left: 8px; height: 37px; }
 .daily-session-date select { min-width: 60px; max-width: 130px; height: 100%; padding: 0 4px 0 2px; color: inherit; border: 0; background: transparent; font-size: .8rem; }
 .daily-scan.button { background: #e7f4eb; color: #154f39; border-color: #cde4d6; min-height: 37px; padding: 7px 10px; font-size: .8rem; }
@@ -160,6 +164,13 @@
 .daily-auto-controls select { min-height: 40px; padding: 5px 12px; border: 1px solid var(--line); border-radius: 8px; background-color: #fff; color: var(--ink); font-size: .86rem; }
 .daily-auto-controls .button { min-height: 40px; }
 .daily-auto-progress { color: var(--muted); font-size: .82rem; }
+.daily-auto-settings { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 24px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; background: #fafcfb; }
+.daily-auto-risk { display: grid; gap: 4px; flex: 0 1 290px; min-width: min(100%, 180px); }
+.daily-auto-risk-heading, .daily-auto-shorts { display: flex; align-items: center; gap: 8px; color: var(--ink); font-size: .85rem; }
+.daily-auto-risk-heading { justify-content: space-between; }
+.daily-auto-risk-heading output { min-width: 3.5em; text-align: right; font-variant-numeric: tabular-nums; font-weight: 670; }
+.daily-auto-risk input, .daily-auto-shorts input { accent-color: #176349; margin: 0; }
+.daily-auto-risk input { width: 100%; min-height: 24px; }
 .paper-results { display: grid; grid-template-columns: minmax(0, 1.48fr) minmax(0, 1fr); gap: 10px; font-variant-numeric: tabular-nums; }
 .paper-result-main {
   min-width: 0; display: grid; align-content: center; gap: 7px; padding: clamp(16px, 2.4vw, 27px);

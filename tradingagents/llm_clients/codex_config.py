@@ -36,7 +36,7 @@ def bridge_url() -> str:
 
 
 def bridge_timeout() -> float:
-    timeout = float(os.getenv("TRADINGAGENTS_CODEX_TIMEOUT", "120"))
+    timeout = float(os.getenv("TRADINGAGENTS_CODEX_TIMEOUT", "600"))
     if not isfinite(timeout) or timeout <= 0:
         raise ValueError("TRADINGAGENTS_CODEX_TIMEOUT must be a positive number of seconds.")
     return timeout

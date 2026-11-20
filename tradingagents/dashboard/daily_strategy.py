@@ -16,13 +16,17 @@ ENTRY_CUTOFF = time(14, 45)
 EXIT_CUTOFF = time(15, 0)
 LAST_CONTINUOUS_BAR = time(15, 15)
 BAR_SECONDS = 300
-RISK_CAP = 0.0065
+DEFAULT_RISK_BPS = 65
+MIN_RISK_BPS = 10
+RISK_CAP = DEFAULT_RISK_BPS / 10_000
 SLIPPAGE = 0.0008
 STRATEGIES = {
     "opening-range": "Opening range breakout",
     "vwap-reclaim": "VWAP reclaim",
     "gap-continuation": "Gap continuation",
 }
+SHORT_STRATEGY = "opening-range-short"
+PAPER_STRATEGIES = {**STRATEGIES, SHORT_STRATEGY: "Opening range breakdown"}
 CLOSED_STATES = {"stop", "target", "time-exit"}
 
 
@@ -47,8 +51,9 @@ def leg_cost(side, amount):
     return (brokerage + exchange_sebi) * 1.18 + statutory + amount * SLIPPAGE
 
 
-def cash_costs(entry, exit_price, quantity):
-    return leg_cost("buy", entry * quantity) + leg_cost("sell", exit_price * quantity)
+def cash_costs(entry, exit_price, quantity, *, short=False):
+    entry_side, exit_side = ("sell", "buy") if short else ("buy", "sell")
+    return leg_cost(entry_side, entry * quantity) + leg_cost(exit_side, exit_price * quantity)
 
 
 def long_exit(bar, stop, target):
@@ -63,22 +68,37 @@ def long_exit(bar, stop, target):
     return None
 
 
-def position_size(entry, stop, target, budget):
-    if not 0 < stop < entry < target:
+def short_exit(bar, stop, target):
+    if bar.local.time() >= EXIT_CUTOFF:
+        return bar.open, "time-exit", bar.time
+    if bar.open <= target:
+        return target, "target", bar.time
+    if bar.high >= stop:
+        return max(stop, bar.open), "stop", bar.time if bar.open >= stop else bar.time + BAR_SECONDS
+    if bar.low <= target:
+        return target, "target", bar.time + BAR_SECONDS
+    return None
+
+
+def position_size(entry, stop, target, budget, *, short=False, risk_bps=DEFAULT_RISK_BPS):
+    floor, ceiling = (target, stop) if short else (stop, target)
+    if not 0 < floor < entry < ceiling:
         return None
-    loss_one = entry - stop + cash_costs(entry, stop, 1)
-    reward_one = target - entry - cash_costs(entry, target, 1)
-    quantity = math.floor(min(budget / (entry * 1.002), budget * RISK_CAP / loss_one))
-    loss = (entry - stop) * quantity + cash_costs(entry, stop, quantity)
+    loss_distance = abs(entry - stop)
+    loss_one = loss_distance + cash_costs(entry, stop, 1, short=short)
+    reward_one = abs(target - entry) - cash_costs(entry, target, 1, short=short)
+    quantity = math.floor(min(budget / (entry * 1.002), budget * risk_bps / 10_000 / loss_one))
+    round_trip = cash_costs(entry, stop, quantity, short=short)
+    loss = loss_distance * quantity + round_trip
     spend = entry * quantity
     return {
         "quantity": quantity,
         "capital": round(spend, 2),
         "estimated_loss": round(loss, 2),
         "budget_risk_pct": round(loss / budget * 100, 3) if budget else 0,
-        "stop_distance_pct": round((entry - stop) / entry * 100, 2),
+        "stop_distance_pct": round(loss_distance / entry * 100, 2),
         "reward_risk": round(reward_one / loss_one, 2),
-        "estimated_round_trip": round(cash_costs(entry, stop, quantity), 2),
+        "estimated_round_trip": round(round_trip, 2),
     }
 
 
@@ -102,58 +122,76 @@ def indicators(previous, today):
 
 def _setup(kind, trigger, stop, bar, feature, reason, gap):
     # A minimum price buffer keeps rounding from making the levels equal.
+    short = kind == SHORT_STRATEGY
+    direction = -1 if short else 1
     trigger, stop = round(trigger, 2), round(stop, 2)
-    if trigger <= 0 or stop <= 0 or trigger - stop < max(0.02, trigger * 0.001):
+    distance = (trigger - stop) * direction
+    if trigger <= 0 or stop <= 0 or distance < max(0.02, trigger * 0.001):
         return None
-    max_entry = round(trigger + min((trigger - stop) * 0.18, trigger * 0.002), 2)
-    target = round(max_entry + (max_entry - stop) * 2.4, 2)
-    stop_pct = (max_entry - stop) / max_entry * 100
+    entry_bound = round(trigger + direction * min(distance * 0.18, trigger * 0.002), 2)
+    target = round(entry_bound + (entry_bound - stop) * 2.4, 2)
+    stop_pct = abs(entry_bound - stop) / entry_bound * 100
     tier = "Low" if stop_pct < 0.4 else "Medium" if stop_pct < 0.75 else "High" if stop_pct < 1.2 else "Very high"
     return {
-        "strategy": kind, "label": STRATEGIES[kind], "status": "watch",
-        "trigger": trigger, "entry_cap": max_entry, "stop": stop, "target": target,
+        "strategy": kind, "label": PAPER_STRATEGIES[kind], "status": "watch",
+        "trigger": trigger, "entry_cap": entry_bound, "stop": stop, "target": target,
         "risk": tier, "relative_volume": round(feature["rvol"], 2) if feature["rvol"] is not None else None,
         "vwap": round(feature["vwap"], 2), "gap_pct": round(gap, 2) if gap is not None else None,
         "observed_at": bar.time + BAR_SECONDS, "reason": reason,
     }
 
 
-def _advance(idea, bar, active_at):
+def _advance(idea, bar, active_at, entry_delay_bars):
     start = bar.local.time()
+    short = idea["strategy"] == SHORT_STRATEGY
     if idea["status"] == "confirmed":
-        if bar.time != idea["confirmation_at"]:
+        entry_at = idea["confirmation_at"] + entry_delay_bars * BAR_SECONDS
+        if bar.time < entry_at:
+            return
+        if bar.time != entry_at:
             idea.update(status="missed", exit_at=bar.time, exit_reason="The next five-minute candle was unavailable.")
             return
-        if start >= ENTRY_CUTOFF or bar.open < idea["trigger"] or bar.open > idea["entry_cap"]:
+        if start >= ENTRY_CUTOFF or not in_entry_range(idea, bar.open):
             idea.update(status="missed", exit_at=bar.time, exit_reason="The next opening price was outside the entry range.")
             return
         idea.update(status="open", entry=round(bar.open, 2), entry_at=bar.time)
     if idea["status"] != "open":
         return
-    outcome = long_exit(bar, idea["stop"], idea["target"])
+    exit_rule = short_exit if short else long_exit
+    outcome = exit_rule(bar, idea["stop"], idea["target"])
     if not outcome:
         return
     price, status, _ = outcome
     reason = {
         "time-exit": "The strategy's intraday exit cutoff was reached.",
         "target": "Price reached the planned target.",
-        "stop": "Price touched or opened below the stop.",
+        "stop": "Price touched or moved beyond the stop.",
     }[status]
-    if bar.open >= idea["target"] and status == "target":
+    if status == "target" and (bar.open <= idea["target"] if short else bar.open >= idea["target"]):
         reason = "The candle opened beyond the target. The model used the target price."
     idea.update(status=status, exit_price=round(price, 2), exit_at=bar.time if start >= EXIT_CUTOFF else active_at,
                 exit_reason=reason)
 
 
-def evaluate(previous, bars, prior_close, budget=5000):
-    """Replay available bars in order. The confirmation close cannot be the fill."""
+def in_entry_range(idea, price):
+    lower, upper = sorted((idea["trigger"], idea["entry_cap"]))
+    return lower <= price <= upper
+
+
+def has_opening_range(bars):
     if len(bars) < 3:
-        return [], indicators(previous, bars)
+        return False
+    first = int(datetime.combine(bars[0].local.date(), OPEN, IST).timestamp())
+    return all(bar.volume > 0 and bar.time == first + index * BAR_SECONDS
+               for index, bar in enumerate(bars[:3]))
+
+
+def evaluate(previous, bars, prior_close, budget=5000, *, allow_shorts=False, entry_delay_bars=0):
+    """Replay available bars in order. The confirmation close cannot be the fill."""
     features = indicators(previous, bars)
-    opening = bars[:3]
-    first = opening[0].local.replace(hour=9, minute=15, second=0, microsecond=0)
-    if any(bar.time != int(first.timestamp()) + index * BAR_SECONDS for index, bar in enumerate(opening)):
+    if not has_opening_range(bars):
         return [], features
+    opening = bars[:3]
     opening_high = max(bar.high for bar in opening)
     opening_low = min(bar.low for bar in opening)
     session_low = opening_low
@@ -167,7 +205,7 @@ def evaluate(previous, bars, prior_close, budget=5000):
         for idea in ideas.values():
             if idea["status"] == "open" and bar.time != bars[index - 1].time + BAR_SECONDS:
                 idea.update(status="data-gap", exit_reason="A candle was missing while the simulated trade was open.")
-            _advance(idea, bar, complete_at)
+            _advance(idea, bar, complete_at, entry_delay_bars)
         if (index == 2 or bar.time != bars[index - 1].time + BAR_SECONDS
                 or datetime.fromtimestamp(complete_at, IST).time() >= ENTRY_CUTOFF):
             continue
@@ -190,7 +228,16 @@ def evaluate(previous, bars, prior_close, budget=5000):
              strong_opening, 1.5, "Watch for the positive opening gap to hold through a break of the opening range.",
              "The opening gap held and a completed candle cleared the opening range on elevated volume."),
         )
+        if allow_shorts:
+            near_low = bar.close <= opening_low * 1.008 and bar.close <= vwap
+            breakdown = bar.close < opening_low and prior.close >= opening_low and bar.close < vwap
+            candidates += ((
+                SHORT_STRATEGY, opening_low, min(opening_high, max(vwap, opening_low * 1.004)),
+                near_low, breakdown, 1.5, "Watch for a close below the first 15-minute low and session VWAP.",
+                "A completed candle closed below the first 15-minute low and session VWAP with elevated volume.",
+            ),)
         for kind, trigger, stop, watch, crossed, min_volume, watch_reason, confirmed_reason in candidates:
+            short = kind == SHORT_STRATEGY
             existing = ideas.get(kind)
             if existing and existing["status"] != "watch":
                 continue
@@ -198,11 +245,11 @@ def evaluate(previous, bars, prior_close, budget=5000):
                 ideas.pop(kind, None)
                 continue
             if crossed and rvol is not None and rvol >= min_volume:
-                trigger = max(trigger, bar.close)
+                trigger = min(trigger, bar.close) if short else max(trigger, bar.close)
             idea = _setup(kind, trigger, stop, bar, feature, watch_reason, gap)
             if idea is None:
                 continue
-            sized = position_size(idea["entry_cap"], idea["stop"], idea["target"], budget)
+            sized = position_size(idea["entry_cap"], idea["stop"], idea["target"], budget, short=short)
             if (crossed and rvol is not None and rvol >= min_volume and sized
                     and sized["quantity"] > 0 and sized["reward_risk"] >= 1.5):
                 idea.update(status="confirmed", confirmation_at=complete_at, reason=confirmed_reason)
@@ -211,8 +258,6 @@ def evaluate(previous, bars, prior_close, budget=5000):
     for idea in ideas.values():
         if idea["status"] == "watch" and bars[-1].local.time() >= ENTRY_CUTOFF:
             idea["status"] = "expired"
-        if idea.get("entry"):
-            idea["size"] = position_size(idea["entry"], idea["stop"], idea["target"], budget)
-        else:
-            idea["size"] = position_size(idea["entry_cap"], idea["stop"], idea["target"], budget)
+        idea["size"] = position_size(idea.get("entry") or idea["entry_cap"], idea["stop"], idea["target"], budget,
+                                     short=idea["strategy"] == SHORT_STRATEGY)
     return list(ideas.values()), features

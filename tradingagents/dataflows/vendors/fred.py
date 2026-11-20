@@ -143,6 +143,10 @@ def _fred_today() -> str:
     return datetime.now(FRED_TZ).strftime("%Y-%m-%d")
 
 
+class _VintageUnavailable(ValueError):
+    """FRED has no ALFRED record for the requested series and date."""
+
+
 def _request(path: str, params: dict) -> dict:
     """GET a FRED endpoint, surfacing FRED's JSON error body on a bad request."""
     api_key = get_api_key()
@@ -160,6 +164,8 @@ def _request(path: str, params: dict) -> dict:
             message = response.json().get("error_message", response.text)
         except ValueError:
             message = response.text
+        if "series does not exist in alfred" in str(message).lower():
+            raise _VintageUnavailable(message)
         raise ValueError(f"FRED request failed: {message}")
     return response.json()
 
@@ -211,28 +217,33 @@ def get_macro_data(
     except ValueError as e:
         return f"FRED: {e}"
 
-    meta = _request("series", {"series_id": series_id, **realtime}).get("seriess") or []
-    if not meta:
+    try:
+        meta = _request("series", {"series_id": series_id, **realtime}).get("seriess") or []
+        if not meta:
+            return (
+                f"FRED series '{series_id}' not found. Pass a known alias "
+                f"(e.g. 'cpi', 'unemployment') or a valid FRED series ID."
+            )
+        observations = _request(
+            "series/observations",
+            {
+                "series_id": series_id,
+                "observation_start": start_date,
+                "observation_end": as_of_date,
+                "sort_order": "asc",
+                **realtime,
+            },
+        ).get("observations", [])
+    except _VintageUnavailable:
         return (
-            f"FRED series '{series_id}' not found. Pass a known alias "
-            f"(e.g. 'cpi', 'unemployment') or a valid FRED series ID."
+            f"FRED series '{series_id}' has no ALFRED vintage for {pit}. "
+            "Try a different series with point-in-time coverage."
         )
     info = meta[0]
     title = info.get("title", series_id)
     units = info.get("units_short") or info.get("units", "")
     frequency = info.get("frequency", "")
     seasonal = info.get("seasonal_adjustment_short", "")
-
-    observations = _request(
-        "series/observations",
-        {
-            "series_id": series_id,
-            "observation_start": start_date,
-            "observation_end": as_of_date,
-            "sort_order": "asc",
-            **realtime,
-        },
-    ).get("observations", [])
 
     # FRED encodes a missing observation as ".".
     points = [

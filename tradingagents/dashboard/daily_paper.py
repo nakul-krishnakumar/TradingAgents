@@ -18,17 +18,22 @@ from tradingagents.diagnostics import event, trace_context
 
 from .daily_strategy import (
     BAR_SECONDS,
+    DEFAULT_RISK_BPS,
     ENTRY_CUTOFF,
     IST,
     LAST_CONTINUOUS_BAR,
-    RISK_CAP,
+    MIN_RISK_BPS,
+    PAPER_STRATEGIES,
+    SHORT_STRATEGY,
     STRATEGIES,
     Candle,
+    in_entry_range,
     leg_cost,
     long_exit,
     position_size,
+    short_exit,
 )
-from .workspace_store import ZERO, cash_value, ledger
+from .workspace_store import ZERO, cash_value
 
 FINAL_SCAN = time(15, 31)
 ENTRY_LAG_TOLERANCE = 60
@@ -38,6 +43,8 @@ logger = logging.getLogger(__name__)
 class AutoTradeSettings(BaseModel):
     enabled: bool
     sessions: int = Field(default=5, ge=1, le=5)
+    risk_bps: int = Field(default=DEFAULT_RISK_BPS, ge=MIN_RISK_BPS, le=DEFAULT_RISK_BPS)
+    allow_shorts: bool = False
 
 
 def _money(price, quantity):
@@ -48,38 +55,42 @@ def _fees(side, price, quantity):
     return cash_value(Decimal(str(leg_cost(side, float(_money(price, quantity))))))
 
 
-def _required(price, quantity):
-    return _money(price, quantity) + _fees("buy", price, quantity)
+def _required(price, quantity, side):
+    return _money(price, quantity) + _fees(side, price, quantity)
 
 
-def _size(idea, cash, budget):
+def _size(idea, cash, budget, risk_bps, short):
     entry, stop = idea["entry_cap"], idea["stop"]
-    plan = position_size(entry, stop, idea["target"], float(budget))
+    plan = position_size(entry, stop, idea["target"], float(budget), short=short, risk_bps=risk_bps)
     if not plan or plan["reward_risk"] < 1.5:
         return 0
-    risk_limit = budget * Decimal(str(RISK_CAP))
-    low, high = 0, min(plan["quantity"], math.floor(cash / Decimal(str(entry))))
+    risk_limit = budget * risk_bps / 10_000
+    funding_price = max(entry, idea["trigger"])
+    entry_side, exit_side = ("sell", "buy") if short else ("buy", "sell")
+    low, high = 0, min(plan["quantity"], math.floor(cash / Decimal(str(funding_price))))
     while low < high:
         quantity = (low + high + 1) // 2
-        risk = _required(entry, quantity) - _money(stop, quantity) + _fees("sell", stop, quantity)
-        if _required(entry, quantity) <= cash and risk <= risk_limit:
+        risk = abs(_money(entry, quantity) - _money(stop, quantity))
+        risk += _fees(entry_side, entry, quantity) + _fees(exit_side, stop, quantity)
+        if _required(funding_price, quantity, entry_side) <= cash and risk <= risk_limit:
             low = quantity
         else:
             high = quantity - 1
     return low
 
 
-def _new_day(day, budget):
+def _new_day(day, budget, trial):
     return {
         "day": day, "budget": str(cash_value(Decimal(str(budget)))), "orders": [], "pending": {}, "positions": {},
         "seen": [], "skipped": {}, "scanned": [], "scans": 0, "last_scan": None, "closed": False,
         "peak_invested": "0.00", "activity": [],
+        "risk_bps": trial.get("risk_bps", DEFAULT_RISK_BPS), "allow_shorts": trial.get("allow_shorts", False),
     }
 
 
-def _skip(book, skipped, symbol, strategy, explanation):
+def _skip(book, skipped, symbol, strategy, explanation, **prices):
     book["skipped"][explanation] = book["skipped"].get(explanation, 0) + 1
-    skipped.append({"symbol": symbol, "strategy": strategy, "reason": explanation})
+    skipped.append({"symbol": symbol, "strategy": strategy, "reason": explanation, **prices})
 
 
 def _candles(chart, now):
@@ -99,25 +110,33 @@ def _fill(book, position, side, price, observed_at, recorded_at, source, reason,
         "units": quantity, "price": price, "fee": str(fees), "at": observed_at, "recorded_at": recorded_at,
         "reason": reason, "source": source, "signal_at": position["signal_at"], "submitted_at": position["submitted_at"],
         "bar_at": bar_at, "signal_reason": position.get("signal_reason"),
+        "direction": position.get("direction", "long"),
     }
-    if side == "sell":
-        order["net"] = str(_money(price, quantity) - fees - Decimal(position["cost"]))
+    if side == ("buy" if order["direction"] == "short" else "sell"):
+        order["net"] = str(_open_result(position, price))
     book["orders"].append(order)
     return _money(price, quantity) + fees
 
 
 def _manage_position(book, symbol, position, bars, chart, stamp):
+    short = position.get("direction") == "short"
+    exit_rule = short_exit if short else long_exit
     for bar in bars:
         if bar.time < position["next_bar"]:
+            continue
+        if short and (position.get("data_gap") or bar.time != position["next_bar"]):
+            # An unobserved interval could contain a stop or an unavailable cover.
+            position.update(data_gap=True, next_bar=bar.time + BAR_SECONDS, mark=bar.close,
+                            mark_at=bar.time + BAR_SECONDS)
             continue
         if bar.time != position["next_bar"]:
             # A missing interval prevents reconstructing which level was touched first.
             outcome = (bar.open, "gap-exit", bar.time)
         else:
-            outcome = long_exit(bar, position["stop"], position["target"])
+            outcome = exit_rule(bar, position["stop"], position["target"])
         if outcome:
             price, reason, at = outcome
-            _fill(book, position, "sell", price, at, stamp, chart.get("source"), reason, bar.time)
+            _fill(book, position, "buy" if short else "sell", price, at, stamp, chart.get("source"), reason, bar.time)
             del book["positions"][symbol]
             return
         position.update(next_bar=bar.time + BAR_SECONDS, mark=bar.close, mark_at=bar.time + BAR_SECONDS)
@@ -145,34 +164,39 @@ def _orders_for_scan(book, charts, stamp, live_entries, skipped):
             continue
         del book["pending"][symbol]
         price = round(start.open, 2)
-        if not order["trigger"] <= price <= order["entry_cap"]:
-            _skip(book, skipped, symbol, order["strategy"], "Opening price outside entry range")
+        if not in_entry_range(order, price):
+            lower, upper = sorted((order["trigger"], order["entry_cap"]))
+            _skip(book, skipped, symbol, order["strategy"], "Opening price outside entry range",
+                  opening_price=price, minimum_price=lower, maximum_price=upper, entry_at=enter_at)
             continue
         held = {**order, "entry": price, "entry_at": enter_at, "next_bar": enter_at, "mark": price, "mark_at": enter_at}
-        held["cost"] = str(_fill(book, held, "buy", price, enter_at, stamp, chart.get("source"), "candle-open", start.time))
+        side = "sell" if order.get("direction") == "short" else "buy"
+        held["cost"] = str(_fill(book, held, side, price, enter_at, stamp, chart.get("source"), "candle-open", start.time))
         book["positions"][symbol] = held
         invested = sum((Decimal(pos["cost"]) for pos in book["positions"].values()), ZERO)
         book["peak_invested"] = str(max(invested, Decimal(book["peak_invested"])))
         _manage_position(book, symbol, held, bars, chart, stamp)
 
 
-def _queue(book, ideas, candidates, stamp, armed_at, skipped):
+def _queue(book, ideas, candidates, stamp, trial, skipped):
     enter_at = (stamp // BAR_SECONDS + 1) * BAR_SECONDS
     if datetime.fromtimestamp(enter_at, IST).time() >= ENTRY_CUTOFF:
         return [], None
-    budget = Decimal(book["budget"])
+    budget, cash, _, invested = _account(book)
     reserved = sum((Decimal(order["reserved"]) for order in book["pending"].values()), ZERO)
-    invested = sum((Decimal(pos["cost"]) for pos in book["positions"].values()), ZERO)
-    cash = Decimal(ledger(book["budget"], book["orders"])["cash"])
     available = min(cash, budget - invested) - reserved
     assets = {item["symbol"]: item for item in candidates}
-    fresh = [idea for idea in ideas if idea["status"] == "confirmed" and idea.get("confirmation_at", 0) >= armed_at
+    risk_bps = trial.get("risk_bps", DEFAULT_RISK_BPS)
+    fresh = [idea for idea in ideas if idea["status"] == "confirmed" and idea.get("confirmation_at", 0) >= trial["armed_at"]
              and 0 <= stamp - idea["confirmation_at"] < BAR_SECONDS]
     fresh.sort(key=lambda idea: (-(idea["size"] or {}).get("reward_risk", 0),
                                  -(idea.get("relative_volume") or 0), idea["symbol"], idea["strategy"]))
     seen, queued, checked = set(book["seen"]), [], 0
     for idea in fresh:
         symbol = idea["symbol"]
+        short = idea["strategy"] == SHORT_STRATEGY
+        if short and not (trial.get("allow_shorts") and assets.get(symbol, {}).get("short_eligible")):
+            continue
         signal_id = f"{symbol}:{idea['strategy']}:{idea['confirmation_at']}"
         if signal_id in seen:
             continue
@@ -184,17 +208,20 @@ def _queue(book, ideas, candidates, stamp, armed_at, skipped):
         if symbol not in assets:
             _skip(book, skipped, symbol, idea["strategy"], "Stock details unavailable")
             continue
-        quantity = _size(idea, available, budget)
+        quantity = _size(idea, available, budget, risk_bps, short)
         if quantity <= 0:
             _skip(book, skipped, symbol, idea["strategy"], "Cash or risk limit")
             continue
-        used = _required(idea["entry_cap"], quantity)
+        funding_price = max(idea["entry_cap"], idea["trigger"])
+        used = _required(funding_price, quantity, "sell" if short else "buy")
         market_asset = assets[symbol]
         book["pending"][symbol] = {
             "strategy": idea["strategy"], "quantity": quantity, "enter_at": enter_at,
             "entry_cap": idea["entry_cap"], "trigger": idea["trigger"], "stop": idea["stop"], "target": idea["target"],
             "reserved": str(used), "signal_at": idea["confirmation_at"], "submitted_at": stamp,
             "signal_reason": idea.get("reason"),
+            "direction": "short" if short else "long",
+            "risk_bps": risk_bps,
             "asset": {key: market_asset.get(key) for key in ("symbol", "name", "isin")},
         }
         queued.append(book["pending"][symbol])
@@ -203,33 +230,46 @@ def _queue(book, ideas, candidates, stamp, armed_at, skipped):
     return queued, checked
 
 
-def _open_result(position):
-    price, quantity = position["mark"], position["quantity"]
+def _open_result(position, price=None):
+    price, quantity = position["mark"] if price is None else price, position["quantity"]
+    if position.get("direction") == "short":
+        entry = position["entry"]
+        return (_money(entry, quantity) - _fees("sell", entry, quantity)
+                - _money(price, quantity) - _fees("buy", price, quantity))
     return _money(price, quantity) - _fees("sell", price, quantity) - Decimal(position["cost"])
 
 
+def _account(book):
+    budget = Decimal(book["budget"])
+    realized = sum((Decimal(order["net"]) for order in book["orders"] if "net" in order), ZERO)
+    invested = sum((Decimal(position["cost"]) for position in book["positions"].values()), ZERO)
+    # The simulator reserves a short's entire notional and does not reuse its proceeds.
+    return budget, budget + realized - invested, realized, invested
+
+
 def _summary(book):
-    account = ledger(book["budget"], book["orders"])
-    outcomes = [order for order in book["orders"] if order["side"] == "sell"]
+    budget, cash, realized, invested = _account(book)
+    outcomes = [order for order in book["orders"] if "net" in order]
+    buys = sum(order["side"] == "buy" for order in book["orders"])
     open_count = len(book["positions"])
     reserved = sum((Decimal(item["reserved"]) for item in book["pending"].values()), ZERO)
     fees = sum((Decimal(item["fee"]) for item in book["orders"]), ZERO)
     holdings = book["positions"].values()
-    invested = sum((Decimal(pos["cost"]) for pos in holdings), ZERO)
-    available = max(ZERO, min(Decimal(account["cash"]), Decimal(book["budget"]) - invested) - reserved)
+    available = max(ZERO, min(cash, budget - invested) - reserved)
     net_open = sum((_open_result(pos) for pos in holdings), ZERO)
     money = {
-        "budget": book["budget"], "cash": account["cash"], "reserved": str(reserved), "available": str(available),
-        "realized": account["realized"], "unrealized": str(net_open),
-        "total_result": str(Decimal(account["realized"]) + net_open), "invested": str(invested),
+        "budget": book["budget"], "cash": str(cash), "reserved": str(reserved), "available": str(available),
+        "realized": str(realized), "unrealized": str(net_open),
+        "total_result": str(realized + net_open), "invested": str(invested),
         "peak_invested": book["peak_invested"], "costs": str(fees),
     }
     return {
         "day": book["day"], "closed": book["closed"], "fills": len(book["orders"]), "trades": len(outcomes),
-        "buys": len(book["orders"]) - len(outcomes), "sells": len(outcomes),
+        "buys": buys, "sells": len(book["orders"]) - buys,
         "wins": sum(Decimal(item["net"]) > 0 for item in outcomes), "unresolved": open_count if book["closed"] else 0,
         "open": open_count, "pending": len(book["pending"]), "scans": book["scans"],
-        "candidates": len(book["scanned"]), "last_scan": book["last_scan"], **money,
+        "candidates": len(book["scanned"]), "last_scan": book["last_scan"],
+        "risk_bps": book.get("risk_bps", DEFAULT_RISK_BPS), "allow_shorts": book.get("allow_shorts", False), **money,
     }
 
 
@@ -259,7 +299,10 @@ class DailyPaper:
             cancelled = 0
             if settings.enabled:
                 if not trial or not trial["enabled"]:
-                    state["trial"] = {"enabled": True, "limit": settings.sessions, "days": [], "armed_at": int(now.timestamp())}
+                    state["trial"] = {
+                        "enabled": True, "limit": settings.sessions, "days": [], "armed_at": int(now.timestamp()),
+                        "risk_bps": settings.risk_bps, "allow_shorts": settings.allow_shorts,
+                    }
             elif trial and trial["enabled"]:
                 trial["enabled"] = False
                 trial["ended_by"] = "user"
@@ -270,7 +313,12 @@ class DailyPaper:
                         book["pending"].clear()
             self._save(state)
         event(logger, "paper.settings_saved", "Auto Trade settings saved", enabled=settings.enabled, sessions=settings.sessions,
-              cancelled_buys=cancelled)
+              cancelled_entries=cancelled, risk_bps=settings.risk_bps, allow_shorts=settings.allow_shorts)
+
+    def short_entries_enabled(self):
+        with self.guard:
+            trial = self._load()["trial"] or {}
+            return bool(trial.get("enabled") and trial.get("allow_shorts"))
 
     def inputs(self, day, time_of_day):
         with self.guard:
@@ -303,7 +351,7 @@ class DailyPaper:
                 if day not in trial["days"]:
                     trial["days"].append(day)
                 if not book:
-                    book = books[day] = _new_day(day, budget)
+                    book = books[day] = _new_day(day, budget, trial)
             if not book or book["closed"]:
                 if changed:
                     self._save(state)
@@ -313,7 +361,9 @@ class DailyPaper:
             _orders_for_scan(book, charts, stamp, trading, skipped)
             queued, checked = [], None
             if trading and now.time() < ENTRY_CUTOFF:
-                queued, checked = _queue(book, ideas, candidates, stamp, trial["armed_at"], skipped)
+                book.update(risk_bps=trial.get("risk_bps", DEFAULT_RISK_BPS),
+                            allow_shorts=trial.get("allow_shorts", False))
+                queued, checked = _queue(book, ideas, candidates, stamp, trial, skipped)
             book["scans"] += 1
             book["last_scan"] = stamp
             for symbol in charts:
@@ -350,13 +400,17 @@ class DailyPaper:
         for order in orders:
             event(logger, f"paper.{order['side']}", "Simulated order completed", date=day, check=book["scans"],
                   symbol=order["asset"]["symbol"], strategy=order["strategy"], price=order["price"], shares=order["units"],
-                  fee=order["fee"], result=order.get("net"), market_at=order["at"], reason=order["reason"])
+                  fee=order["fee"], direction=order["direction"], result=order.get("net"),
+                  market_at=order["at"], reason=order["reason"])
         for order in queued:
-            event(logger, "paper.buy_queued", "A simulated buy is waiting for the next prices", date=day,
+            lower, upper = sorted((order["trigger"], order["entry_cap"]))
+            action = "short" if order["direction"] == "short" else "buy"
+            event(logger, f"paper.{action}_queued", "A simulated entry is waiting for the next prices", date=day,
                   symbol=order["asset"]["symbol"], strategy=order["strategy"], shares=order["quantity"],
-                  minimum_price=order["trigger"], maximum_price=order["entry_cap"])
+                  direction=order["direction"], minimum_price=lower, maximum_price=upper)
         for captured in skipped:
-            event(logger, "paper.buy_skipped", "A simulated buy was skipped", date=day, **captured)
+            action = "short" if captured["strategy"] == SHORT_STRATEGY else "buy"
+            event(logger, f"paper.{action}_skipped", "A simulated entry was skipped", date=day, **captured)
         if book["closed"]:
             summary = _summary(book)
             event(logger, "paper.day_closed", "Paper trading day closed", date=day, sells=summary["sells"],
@@ -369,7 +423,7 @@ class DailyPaper:
             book = state["books"].get(day)
             history = [_summary(state["books"][key]) for key in sorted(state["books"], reverse=True)[:30]]
             closed_results = [Decimal(order["net"]) for saved in state["books"].values()
-                              for order in saved["orders"] if order["side"] == "sell"]
+                              for order in saved["orders"] if "net" in order]
             overview = {"trial": state["trial"], "history": history, "totals": {
                 "days": len(state["books"]), "trades": len(closed_results),
                 "wins": sum(result > 0 for result in closed_results),
@@ -378,10 +432,12 @@ class DailyPaper:
             if not book:
                 return {**overview, "session": None}
             fills = sorted(book["orders"], key=lambda item: item["at"], reverse=True)
-            counts = Counter(order["strategy"] for order in book["orders"] if order["side"] == "sell")
+            counts = Counter(order["strategy"] for order in book["orders"] if "net" in order)
+            has_shorts = book.get("allow_shorts") or any(order.get("direction") == "short" for order in fills)
+            methods = PAPER_STRATEGIES if has_shorts else STRATEGIES
             realized = {key: str(sum((Decimal(item["net"]) for item in book["orders"]
-                                      if item["side"] == "sell" and item["strategy"] == key), ZERO))
-                        for key in STRATEGIES}
+                                      if "net" in item and item["strategy"] == key), ZERO))
+                        for key in methods}
             session = {
                 **_summary(book), "orders": fills,
                 "holdings": [{**position, "unrealized": str(_open_result(position))} for position in book["positions"].values()],
@@ -391,7 +447,7 @@ class DailyPaper:
                 } for scan in reversed(book.get("activity", []))],
                 "skipped": book["skipped"], "strategies": [
                     {"key": key, "label": label, "trades": counts[key], "net": realized[key]}
-                    for key, label in STRATEGIES.items()
+                    for key, label in methods.items()
                 ],
             }
             return {**overview, "session": session}

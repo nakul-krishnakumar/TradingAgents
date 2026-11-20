@@ -49,6 +49,30 @@ def _request_stub(meta=_META, obs=_OBS):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("missing_at", ["series", "series/observations"])
+def test_missing_alfred_vintage_keeps_the_as_of_date(monkeypatch, missing_at):
+    monkeypatch.setenv("FRED_API_KEY", "test-key")
+    calls = []
+
+    def respond(url, *, params, **kwargs):
+        assert params["realtime_start"] == params["realtime_end"] == "2025-09-10"
+        path = url.removeprefix(f"{fred.FRED_API_BASE}/")
+        calls.append(path)
+        response = mock.Mock()
+        response.status_code = 400 if path == missing_at else 200
+        response.json.return_value = (
+            {"error_message": "Bad Request. The series does not exist in ALFRED"}
+            if path == missing_at else _META
+        )
+        return response
+
+    monkeypatch.setattr(fred, "get_scrubbed", respond)
+    report = fred.get_macro_data("unemployment", "2025-09-10")
+    assert "UNRATE" in report and "no ALFRED vintage for 2025-09-10" in report
+    assert calls == (["series"] if missing_at == "series" else ["series", missing_at])
+
+
+@pytest.mark.unit
 class FredResolutionTests(unittest.TestCase):
     def test_alias_maps_to_series_id(self):
         self.assertEqual(fred._resolve_series_id("cpi"), "CPIAUCSL")

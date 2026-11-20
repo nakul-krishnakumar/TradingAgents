@@ -420,4 +420,10 @@ if __name__ == "__main__":
 
     dictConfig(uvicorn.config.LOGGING_CONFIG)
     configure_logging("market-desk", CONFIG["results_dir"])
-    uvicorn.run(app, host="127.0.0.1", port=int(sys.argv[1]), access_log=False, log_config=None)
+    port = int(sys.argv[1])
+    if TUNNEL_MODE:
+        from .tunnel import serve_origin
+
+        serve_origin(app, port)
+    else:
+        uvicorn.run(app, host="127.0.0.1", port=port, access_log=False, log_config=None)
